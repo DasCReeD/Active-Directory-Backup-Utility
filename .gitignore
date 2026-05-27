@@ -1,0 +1,39 @@
+# ── .NET Build Artifacts ──────────────────────────────────────────
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.pdb
+
+# ── Node dependencies ────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Config and local database files (keys/history) ───────────────
+config/app_config.json
+config/backup_history.json
+
+# ── Environment variables ────────────────────────────────────────
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ── Operating System Files ───────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# ── IDE / Editor ─────────────────────────────────────────────────
+.vs/
+.vscode/
+*.swp
+*~
+
+# ── Archives ─────────────────────────────────────────────────────
+*.zip
