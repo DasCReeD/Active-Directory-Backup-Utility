@@ -312,7 +312,12 @@ public class BackupOrchestrator
                 Log(progress, "WARN", $"Could not set NTFS permissions on VHDX root drive {vhdxDriveLetter}:\\ : {ex.Message}");
             }
 
-            // ── Step 6b: Enable R2L symlink evaluation on the remote client ──────
+            // ── Step 6b: Enable R2L symlink evaluation ──────────────────────────
+            // Both the SERVER (this machine) and the CLIENT need R2L enabled:
+            //  - Server: traverses \\CLIENT\C$\symlink (remote→local from server's perspective)
+            //  - Client: hosts the symlink that points to a local VSS device path
+            Log(progress, "INFO", "Ensuring R2L symlink evaluation is enabled on this server...");
+            EnableLocalSymlinkEvaluation(progress);
             Log(progress, "INFO", $"Ensuring R2L symlink evaluation is enabled on {computerName}...");
             await Task.Run(() => EnableRemoteSymlinkEvaluation(computerName, progress), ct);
             ct.ThrowIfCancellationRequested();
@@ -336,8 +341,35 @@ public class BackupOrchestrator
             vssSymlinkCreated = true;
             ct.ThrowIfCancellationRequested();
 
-            // ── Step 7c: Server-pull robocopy from client admin share → local VHDX ──
+            // ── Step 7b.1: Validate server can access the symlink via admin share ─
             var uncSource = $"\\\\{computerName}\\C$\\adshield_vss_link";
+            Log(progress, "INFO", $"Validating server-side access to {uncSource}...");
+            bool pathAccessible = false;
+            for (int attempt = 1; attempt <= 5; attempt++)
+            {
+                try
+                {
+                    if (Directory.Exists(uncSource))
+                    {
+                        pathAccessible = true;
+                        Log(progress, "SUCCESS", $"Remote VSS path accessible on attempt {attempt}.");
+                        break;
+                    }
+                }
+                catch { /* ignore transient access errors */ }
+
+                Log(progress, "INFO", $"Path not yet accessible (attempt {attempt}/5), waiting 2s...");
+                await Task.Delay(2000, ct);
+            }
+            if (!pathAccessible)
+            {
+                throw new Exception(
+                    $"Cannot access {uncSource} after 5 attempts. " +
+                    "Verify R2L symlink evaluation is enabled on both server and client. " +
+                    "Run: fsutil behavior set symlinkevaluation R2L:1");
+            }
+
+            // ── Step 7c: Server-pull robocopy from client admin share → local VHDX ──
             Log(progress, "INFO", $"Copying data: {uncSource} → {vhdxDriveLetter}:\\");
             Log(progress, "INFO", "This may take a while depending on data size. Please wait...");
             await RunLocalDataCopy(uncSource, $"{vhdxDriveLetter}:\\", computerName, progress, ct);
@@ -578,6 +610,58 @@ public class BackupOrchestrator
                 return devicePath.TrimEnd('\\') + "\\";
         }
         throw new Exception($"Shadow copy {shadowId} not found on {computerName}");
+    }
+
+    /// <summary>
+    /// Enables Remote-to-Local (R2L) symlink evaluation on the LOCAL backup server.
+    /// The server needs this because it traverses a symlink on the remote client's admin share
+    /// (\\CLIENT\C$\adshield_vss_link) that points to a local device path on the client.
+    /// Idempotent — safe to call multiple times. Only writes if not already enabled.
+    /// </summary>
+    private static void EnableLocalSymlinkEvaluation(IProgress<string> progress)
+    {
+        try
+        {
+            // Check current value first
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\FileSystem", writable: true);
+            if (key != null)
+            {
+                var current = key.GetValue("SymlinkRemoteToLocalEvaluation");
+                if (current is int val && val == 1)
+                {
+                    progress.Report("[INFO] R2L symlink evaluation already enabled on this server.");
+                    return;
+                }
+
+                key.SetValue("SymlinkRemoteToLocalEvaluation", 1, Microsoft.Win32.RegistryValueKind.DWord);
+                progress.Report("[SUCCESS] R2L symlink evaluation enabled on this server.");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            progress.Report($"[WARN] Registry write failed: {ex.Message}. Trying fsutil...");
+        }
+
+        // Fallback: fsutil
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("fsutil", "behavior set symlinkevaluation R2L:1")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            proc?.WaitForExit(10000);
+            progress.Report("[SUCCESS] R2L symlink evaluation enabled via fsutil on this server.");
+        }
+        catch (Exception ex2)
+        {
+            progress.Report($"[WARN] fsutil fallback also failed: {ex2.Message}. Run manually: fsutil behavior set symlinkevaluation R2L:1");
+        }
     }
 
     /// <summary>
