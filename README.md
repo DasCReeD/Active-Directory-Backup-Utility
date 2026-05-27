@@ -1,4 +1,4 @@
-# AD Shield — Agentless Network Backup & Dashboard
+# AD Shield — Agentless Network Backup Orchestrator
 
 **ADShield** is an enterprise-grade, agentless backup orchestrator for Windows Active Directory environments. It runs as a native Windows application (.NET 8 WinForms) on a Domain Controller or backup server, and coordinates encrypted VSS-based system backups across all domain computers — **zero software installed on target machines**.
 
@@ -6,8 +6,9 @@
 
 ## Key Features
 
-- **100% Agentless** — Remote execution via WMI only; no client-side agents, scripts, or services installed
-- **VSS Block-Level Backups** — Uses Windows Volume Shadow Copy for consistent, open-file safe backups
+- **100% Agentless** — Remote execution via WMI only; no client-side agents, scripts, or services
+- **Server-Pull Architecture** — Robocopy runs locally on the backup server, pulling data from client admin shares. Eliminates Kerberos double-hop authentication failures
+- **VSS Block-Level Backups** — Uses Windows Volume Shadow Copy for consistent, open-file safe snapshots
 - **AES-256 Encrypted Storage** — All backup data lives inside a VeraCrypt encrypted container at rest
 - **Per-Machine VHDX Isolation** — Each computer gets its own dynamically-sized virtual disk (`.vhdx`) inside the vault
 - **LDAP AD Discovery** — Queries Active Directory directly via `System.DirectoryServices`; no AD PowerShell module needed
@@ -25,17 +26,17 @@ sequenceDiagram
     participant BO as Backup Engine
     participant VC as VeraCrypt Vault (V:\)
     participant VHDX as disk.vhdx (B:\)
-    participant SMB as Hidden Share (\\server\backup_PC$)
     participant CLI as Target Client (WMI)
 
     UI->>BO: Trigger backup for DESKTOP-001
     BO->>VC: Mount encrypted vault
     BO->>VHDX: Create & attach 120 GB VHDX
-    BO->>SMB: Create hidden SMB share → B:\
+    BO->>CLI: Enable R2L symlink evaluation (WMI registry)
     BO->>CLI: Create VSS shadow copy (C:\) via WMI
-    CLI->>SMB: robocopy VSS shadow → \\server\backup_PC$
-    BO->>CLI: Delete VSS shadow
-    BO->>SMB: Remove SMB share
+    BO->>CLI: Create symlink to VSS shadow (WMI)
+    BO->>BO: robocopy \\CLIENT\C$\adshield_vss_link → B:\
+    BO->>CLI: Remove VSS symlink (WMI)
+    BO->>CLI: Delete VSS shadow copy
     BO->>VHDX: Detach VHDX
     BO->>UI: "Backup sequence completed!"
 ```
@@ -50,15 +51,16 @@ The backup engine automatically sizes each VHDX to the remote machine's actual d
 Active-Directory-Backup-Utility-main/
 ├── ADShield/                           # .NET 8 WinForms application
 │   ├── Core/
-│   │   ├── BackupOrchestrator.cs       # 8-step agentless backup pipeline
+│   │   ├── BackupOrchestrator.cs       # 8-step agentless backup pipeline (server-pull)
 │   │   ├── AdDiscovery.cs              # LDAP AD computer discovery
 │   │   ├── AppConfig.cs                # JSON config & history persistence
 │   │   ├── VeraCryptManager.cs         # Encrypted vault mount/dismount
 │   │   ├── VssManager.cs               # WMI VSS shadow copy management
 │   │   ├── VhdxManager.cs              # Native VirtDisk.dll VHDX API
-│   │   ├── SmbShareManager.cs          # WMI Win32_Share dynamic shares
+│   │   ├── SmbShareManager.cs          # WMI Win32_Share (legacy, retained for compat)
 │   │   ├── SchedulerService.cs         # Cron-style backup scheduler
-│   │   └── BackupSelfHealingTest.cs    # VHDX regression test suite
+│   │   ├── BackupSelfHealingTest.cs    # VHDX self-healing regression tests
+│   │   └── BackupServerPullTest.cs     # Server-pull architecture integration tests
 │   ├── Forms/
 │   │   ├── MainForm.cs                 # Application shell & 4-page nav
 │   │   ├── MainForm.Events.cs          # UI event handlers
@@ -68,16 +70,12 @@ Active-Directory-Backup-Utility-main/
 │   │   ├── AppSettings.cs              # Configuration model
 │   │   └── ComputerEntry.cs            # AD computer + backup status model
 │   └── ADShield.csproj
-├── backend/
-│   └── powershell/
-│       ├── Backup-Orchestrator.ps1     # Legacy PowerShell orchestrator
-│       ├── Discover-DomainComputers.ps1
-│       └── Manage-VeraCrypt.ps1
+├── backend/powershell/                 # Legacy PowerShell orchestrator scripts
 ├── docs/
 │   ├── architecture.md                 # System diagrams & component maps
-│   ├── code-reference.md               # Full API reference
-│   ├── deployment-guide.md             # Setup & operations guide
-│   └── winpe_recovery.md               # Bare-metal recovery procedure
+│   ├── code-reference.md              # Full API reference
+│   ├── deployment-guide.md            # Setup & operations guide
+│   └── winpe_recovery.md              # Bare-metal recovery procedure
 ├── public/                             # Legacy web dashboard (Node.js era)
 ├── server.js                           # Legacy Express server
 └── README.md
@@ -94,17 +92,32 @@ Active-Directory-Backup-Utility-main/
 | Windows Server 2019+ or Windows 10 21H2+ | Domain-joined |
 | .NET 8 Desktop Runtime | [Download](https://dotnet.microsoft.com/download/dotnet/8) |
 | VeraCrypt v1.26+ | [Download](https://www.veracrypt.fr) |
-| Domain Administrator account | Required for WMI remote access |
+| Domain Administrator account | Required for WMI remote access and admin share (`C$`) |
 | **Run as Administrator** | Required for diskpart, WMI impersonation |
 
-### Setup
+### Build & Run
 
-1. **Install** .NET 8 Desktop Runtime and VeraCrypt on the backup server
-2. **Build or deploy** ADShield to the backup server
-3. **Run** `ADShield.exe` as Administrator
-4. **Create** the VeraCrypt encrypted vault in **System Config**
-5. **Sync** Active Directory to discover computers
-6. **Trigger** your first backup from the Dashboard
+```powershell
+# Clone the repository
+git clone <repo-url>
+cd Active-Directory-Backup-Utility-main
+
+# Build
+dotnet build ADShield\ADShield.csproj
+
+# Publish (self-contained optional)
+dotnet publish ADShield\ADShield.csproj -c Release -r win-x64 --self-contained false
+
+# Run as Administrator
+.\ADShield\bin\Release\net8.0-windows\win-x64\publish\ADShield.exe
+```
+
+### First Backup
+
+1. **Run** `ADShield.exe` as Administrator
+2. **Configure** the VeraCrypt vault path and mount letter in **System Config**
+3. **Sync** Active Directory to discover domain computers
+4. **Click** a computer → **Backup** → Enter passphrase → **Full Backup**
 
 For full instructions, see 📖 **[docs/deployment-guide.md](docs/deployment-guide.md)**
 
@@ -121,7 +134,26 @@ For full instructions, see 📖 **[docs/deployment-guide.md](docs/deployment-gui
 
 ---
 
-## Technical Architecture
+## Architecture Overview
+
+### Server-Pull Backup Architecture
+
+The backup engine uses a **server-pull** model where robocopy runs locally on the backup server and reads from the client's admin share (`\\CLIENT\C$`). This eliminates the Kerberos double-hop authentication problem that occurs when a remote process tries to access a third-party network resource.
+
+```
+Backup Server (TESTWIN11)                Target Client (LOCALVM)
+│                                        │
+│── WMI: Enable R2L symlink eval ──────> │   (one-time registry setting)
+│── WMI: Create VSS shadow copy ──────>  │   (single network hop)
+│── WMI: Create symlink to VSS ────────> │   (single network hop)
+│                                        │
+│── LOCAL robocopy ────────────────────>  │
+│   Source: \\LOCALVM\C$\adshield_vss_link   (single hop: server → client)
+│   Dest:   B:\ (local VHDX)                (local write, no network)
+│                                        │
+│── WMI: Remove symlink ──────────────>  │
+│── WMI: Delete VSS shadow ───────────>  │
+```
 
 ### Storage Architecture
 
@@ -140,14 +172,13 @@ VeraCrypt Vault (V:\)           — AES-256 encrypted container
 ### Technology Stack
 
 | Component | Technology |
-|-----------|-----------|
+|-----------|------------|
 | UI | Windows Forms (.NET 8) |
 | AD Integration | `System.DirectoryServices` (LDAP) |
-| Remote Execution | WMI `Win32_Process`, `Win32_ShadowCopy` |
+| Remote Management | WMI `Win32_Process`, `Win32_ShadowCopy`, `StdRegProv` |
 | Virtual Disk | `VirtDisk.dll` (P/Invoke native API) |
 | Encryption | VeraCrypt AES-256 / SHA-512 |
-| File Copy | `robocopy.exe` (invoked remotely via WMI) |
-| SMB Shares | WMI `Win32_Share` |
+| File Copy | `robocopy.exe` (runs locally with `/B` backup mode) |
 | Persistence | `Newtonsoft.Json` |
 
 ---
@@ -155,9 +186,23 @@ VeraCrypt Vault (V:\)           — AES-256 encrypted container
 ## Security Design
 
 - **Passphrase never stored** — VeraCrypt passphrase is entered at runtime and held in memory only
-- **Dynamic share isolation** — Hidden SMB shares (`backup_PC$`) are created only during backup and immediately removed
-- **Per-machine ACLs** — Each share and VHDX root grants access only to the specific target machine's domain account (`DOMAIN\ComputerName$`)
-- **Encrypted at rest** — All VHDX files reside inside the AES-256 VeraCrypt container; the container is locked when not actively backing up
+- **No SMB shares required** — Server-pull architecture reads from pre-existing admin shares (`C$`); no dynamic shares created
+- **Per-machine ACLs** — VHDX root grants access to the specific target machine's domain account (`DOMAIN\ComputerName$`)
+- **Encrypted at rest** — All VHDX files reside inside the AES-256 VeraCrypt container
+- **R2L symlink evaluation** — Enabled per-client via WMI registry write; allows traversal of VSS symlinks through admin shares
+
+---
+
+## Testing
+
+ADShield includes two integration test suites:
+
+| Test Suite | Tests | Purpose |
+|------------|-------|---------|
+| `BackupSelfHealingTest` | 3 | VHDX creation, formatting, and self-healing recovery |
+| `BackupServerPullTest` | 3 | R2L enablement, VSS symlink access, end-to-end server-pull robocopy |
+
+Tests are triggered from the ADShield UI via the maintenance panel.
 
 ---
 

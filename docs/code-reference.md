@@ -60,15 +60,15 @@ Executes the full 8-step backup pipeline for a single domain computer.
 
 **Throws:** `Exception` at any failed step (WMI unreachable, ping failed, robocopy error, etc.)
 
-**Pipeline Steps:**
+**Pipeline Steps (Server-Pull Architecture):**
 1. Verify/mount VeraCrypt vault
 2. ICMP ping target computer
 3. WMI connectivity check
 4. Create per-machine VHDX on backup server (sized to remote C: + 20% headroom)
 5. Mount VHDX locally and initialize NTFS (self-heals RAW partitions)
-6. Create hidden SMB share pointing to mounted VHDX
-7. Trigger VSS shadow copy on remote client via WMI, run robocopy push
-8. Cleanup: delete shadow copy, remove SMB share, detach VHDX
+6. Enable R2L symlink evaluation on remote client (WMI registry write)
+7. Create VSS shadow copy on remote client, create symlink to VSS, run server-pull robocopy
+8. Cleanup: remove symlink, delete shadow copy, detach VHDX
 
 ---
 
@@ -84,6 +84,66 @@ internal static async Task RunLocalDiskpart(
 Writes a diskpart script to a temp file and executes it locally via `cmd.exe /c diskpart /s`. Output is captured and forwarded to `progress`.
 
 > ⚠️ **Requires elevation.** ADShield must run as Administrator for diskpart to succeed.
+
+---
+
+##### `EnableRemoteSymlinkEvaluation` *(private static)*
+
+```csharp
+private static void EnableRemoteSymlinkEvaluation(string computerName, IProgress<string> progress)
+```
+
+Enables Remote-to-Local (R2L) symlink evaluation on the target machine via WMI `StdRegProv` registry write. Sets `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\SymlinkRemoteToLocalEvaluation = 1`. Falls back to `fsutil behavior set symlinkevaluation R2L:1` via WMI `Win32_Process` if the registry method fails. Idempotent — safe to call multiple times.
+
+---
+
+##### `CreateRemoteVssSymlink` *(private static)*
+
+```csharp
+private static async Task CreateRemoteVssSymlink(
+    string computerName, string linkPath, string shadowDevicePath,
+    IProgress<string> progress, CancellationToken ct)
+```
+
+Creates a directory symlink on the remote client (`mklink /d`) pointing to the VSS shadow device path. Cleans up any stale symlink before creating. Uses WMI `Win32_Process.Create`.
+
+---
+
+##### `RemoveRemoteVssSymlink` *(private static)*
+
+```csharp
+private static async Task RemoveRemoteVssSymlink(
+    string computerName, string linkPath,
+    IProgress<string> progress, CancellationToken ct)
+```
+
+Removes the VSS symlink from the remote client (`rmdir`) via WMI. Called during cleanup.
+
+---
+
+##### `RunLocalDataCopy` *(private)*
+
+```csharp
+private async Task RunLocalDataCopy(
+    string uncSource, string localDest, string computerName,
+    IProgress<string> progress, CancellationToken ct)
+```
+
+Runs `robocopy.exe` locally on the backup server, pulling data from the client's admin share (e.g. `\\CLIENT\C$\adshield_vss_link`) into the local VHDX mount (`B:\`). This is the core of the server-pull architecture — single network hop, no Kerberos double-hop.
+
+**Robocopy flags:** `/E /COPY:DAT /B /R:1 /W:1 /NP /XJ`  
+**Timeout:** 2 hours (cancellable)  
+**Exit code handling:** 0–7 = success/warnings, ≥8 = failure (throws)
+
+---
+
+##### `RunRemoteWmiCommand` *(private static)*
+
+```csharp
+private static void RunRemoteWmiCommand(string computerName, string commandLine, int timeoutMs)
+```
+
+Executes a command on a remote machine via WMI `Win32_Process.Create` and polls for process completion. Used for lightweight operations (symlink create/delete, fsutil). NOT for long-running data copies.
 
 ---
 
@@ -409,10 +469,12 @@ Returns `true` if the VHDX file exists at the given path.
 
 ---
 
-### `SmbShareManager`
+### `SmbShareManager` *(Legacy — retained for compatibility)*
 
 **File:** `ADShield/Core/SmbShareManager.cs`  
 **Type:** `public static class`
+
+> ⚠️ **Legacy module.** The server-pull architecture no longer uses dynamic SMB shares during backups. This module is retained for potential future use cases or manual share management but is not called by `BackupOrchestrator`.
 
 Creates and removes dynamic, hidden per-machine SMB shares via WMI `Win32_Share`. No `net.exe` or external tools required.
 
@@ -514,6 +576,57 @@ Runs a 7-step local regression test:
 7. Verify write succeeds after recovery
 
 All artifacts are cleaned up in `finally` regardless of outcome.
+
+---
+
+### `BackupServerPullTest`
+
+**File:** `ADShield/Core/BackupServerPullTest.cs`  
+**Type:** `public static class`
+
+Integration test suite for the server-pull backup architecture. Validates end-to-end that the server can pull data from a remote client's admin share through a VSS symlink.
+
+#### Methods
+
+---
+
+##### `RunAllTests`
+
+```csharp
+public static async Task RunAllTests(string computerName, IProgress<string> progress, CancellationToken ct)
+```
+
+Runs all three server-pull tests in sequence, reporting pass/fail for each.
+
+---
+
+##### `TestR2LSymlinkEvaluation`
+
+```csharp
+public static async Task TestR2LSymlinkEvaluation(string computerName, IProgress<string> progress, CancellationToken ct)
+```
+
+Validates that the R2L symlink evaluation registry key can be enabled on a remote machine via WMI `StdRegProv`. Reads current value → sets to 1 → verifies persistence.
+
+---
+
+##### `TestVssSymlinkAccess`
+
+```csharp
+public static async Task TestVssSymlinkAccess(string computerName, IProgress<string> progress, CancellationToken ct)
+```
+
+Creates a VSS shadow copy and symlink on the remote client, then attempts a `Directory.GetDirectories()` call from the server through the admin share (`\\CLIENT\C$\adshield_test_link`). Validates the full R2L + symlink traversal path.
+
+---
+
+##### `TestEndToEndServerPull`
+
+```csharp
+public static async Task TestEndToEndServerPull(string computerName, IProgress<string> progress, CancellationToken ct)
+```
+
+Full end-to-end test: creates a 50 MB test VHDX, mounts it, creates VSS + symlink on the client, runs a limited robocopy pull (`/LEV:1` — one level deep in Windows directory for speed), and verifies files were copied to the VHDX. All artifacts cleaned up in `finally`.
 
 ---
 

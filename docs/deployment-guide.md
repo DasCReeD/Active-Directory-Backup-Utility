@@ -17,7 +17,7 @@ This guide covers everything needed to deploy, configure, and operate **ADShield
 | **.NET Runtime** | .NET 8.0 Desktop Runtime | [Download](https://dotnet.microsoft.com/download/dotnet/8) |
 | **VeraCrypt** | v1.26+ | Must be installed at configured path |
 | **Free Disk Space** | Sufficient for `.hc` container | Depends on total backup size across all machines |
-| **Run As** | Administrator (elevated) | Required for diskpart, WMI impersonation, SMB share creation |
+| **Run As** | Administrator (elevated) | Required for diskpart, WMI impersonation |
 
 ### Target Client Requirements
 
@@ -25,6 +25,7 @@ This guide covers everything needed to deploy, configure, and operate **ADShield
 |-------------|-------|
 | Domain member | Computer account must be in AD |
 | WMI enabled | Default on Windows; requires firewall exception |
+| Admin share (`C$`) accessible | Default on domain-joined machines with Domain Admin credentials |
 | No agent required | ADShield is 100% agentless |
 
 > **WMI Firewall Rule** — If clients have firewall restrictions, enable:
@@ -72,7 +73,7 @@ Right-click `ADShield.exe` → **Run as Administrator**
 > ADShield requires elevation for:
 > - `diskpart.exe` (VHDX partitioning)
 > - WMI impersonation for remote access
-> - SMB share creation via `Win32_Share`
+> - `robocopy.exe` with `/B` backup mode (SeBackupPrivilege)
 
 ---
 
@@ -172,18 +173,21 @@ VHDX attached locally as B:\
     │  (NTFS formatted, self-heals if RAW)
     │
     ▼
-Hidden SMB share created (\\server\backup_PC-NAME$) → B:\
+R2L symlink evaluation enabled on target PC (WMI registry write)
     │
     ▼
 VSS shadow copy triggered on target PC via WMI
     │
     ▼
-Robocopy runs on target PC, pushing from VSS shadow → SMB share
-    │  (2-hour timeout, excludes: System Volume Information, $Recycle.Bin)
+Symlink created on target PC: C:\adshield_vss_link → VSS shadow
     │
     ▼
+Robocopy runs LOCALLY on server, pulling from \\PC-NAME\C$\adshield_vss_link → B:\
+    │  (2-hour timeout, /B backup mode, excludes: System Volume Information, $Recycle.Bin)
+    │
+    ▼
+Symlink removed on target PC
 VSS shadow copy deleted
-SMB share removed
 VHDX detached
     │
     ▼
@@ -266,11 +270,12 @@ Location: `%AppData%\ADShield\history.json`
 
 | Error Code | Meaning | Action |
 |------------|---------|--------|
-| `ERROR 53` | Network path not found | SMB share or path not accessible; check share creation logs |
-| `ERROR 5` | Access denied | Check NTFS ACLs on the VHDX drive root |
+| `ERROR 53` | Network path not found | Admin share not accessible; verify Domain Admin credentials and `C$` accessibility |
+| `ERROR 5` | Access denied | R2L symlink evaluation may not be enabled; check ADShield logs for R2L step |
 | `ERROR 3` | Path not found | VSS shadow symlink may have failed; check earlier log steps |
+| Exit code ≥ 8 | Robocopy failure | Check the log file at `%TEMP%\adshield_robocopy_<COMPUTERNAME>.log` on the **backup server** |
 
-> All robocopy output is captured in `C:\Windows\Temp\adshield_robocopy.log` on the **target client** machine and displayed in the Operations Terminal.
+> Robocopy runs locally on the backup server. Log files are saved to `%TEMP%\adshield_robocopy_<COMPUTERNAME>.log` on the **server** machine, not the client.
 
 ### Log Levels Reference
 
