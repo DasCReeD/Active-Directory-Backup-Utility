@@ -174,6 +174,7 @@ public class BackupOrchestrator
         string? shadowId = null;
         bool vhdxMounted = false;
         bool vssSymlinkCreated = false;
+        bool vssShareCreated = false;
         var vhdxDriveLetter = "B"; // temp letter for the VHDX locally on the backup server
 
         try
@@ -312,24 +313,17 @@ public class BackupOrchestrator
                 Log(progress, "WARN", $"Could not set NTFS permissions on VHDX root drive {vhdxDriveLetter}:\\ : {ex.Message}");
             }
 
-            // ── Step 6b: Enable R2L symlink evaluation ──────────────────────────
-            // Both the SERVER (this machine) and the CLIENT need R2L enabled:
-            //  - Server: traverses \\CLIENT\C$\symlink (remote→local from server's perspective)
-            //  - Client: hosts the symlink that points to a local VSS device path
-            Log(progress, "INFO", "Ensuring R2L symlink evaluation is enabled on this server...");
-            EnableLocalSymlinkEvaluation(progress);
-            Log(progress, "INFO", $"Ensuring R2L symlink evaluation is enabled on {computerName}...");
-            await Task.Run(() => EnableRemoteSymlinkEvaluation(computerName, progress), ct);
-            ct.ThrowIfCancellationRequested();
-
-            // ── Step 7: Trigger VSS on remote client ──────────────────────────────
+            // ── Step 6b: VSS + Symlink + Hidden Share on Remote Client ────────
+            // Strategy: Create a VSS shadow copy, create a directory symlink to it,
+            // then share the symlink folder as a hidden SMB share.
+            // The SMB server on the client resolves the symlink locally, so the server
+            // can pull data through the share without needing R2L symlink traversal.
             Log(progress, "INFO", $"Triggering VSS shadow copy on {computerName} (C:\\)...");
             shadowId = await Task.Run(() =>
                 VssManager.CreateRemoteShadowCopy(computerName, @"C:\", progress: progress), ct);
             Log(progress, "SUCCESS", $"VSS shadow copy created. ID: {shadowId}");
             ct.ThrowIfCancellationRequested();
 
-            // ── Step 7b: Create symlink on client pointing to VSS shadow ──────────
             Log(progress, "INFO", "Looking up VSS shadow device path...");
             var shadowDevicePath = await Task.Run(() =>
                 GetShadowDevicePath(computerName, shadowId), ct);
@@ -341,8 +335,15 @@ public class BackupOrchestrator
             vssSymlinkCreated = true;
             ct.ThrowIfCancellationRequested();
 
-            // ── Step 7b.1: Validate server can access the symlink via admin share ─
-            var uncSource = $"\\\\{computerName}\\C$\\adshield_vss_link";
+            // ── Step 6c: Create hidden share pointing to the symlink folder ──────
+            var hiddenShareName = $"adshield_backup$";
+            Log(progress, "INFO", $"Creating hidden share \\\\{computerName}\\{hiddenShareName} → {tempLinkPath}...");
+            await Task.Run(() => CreateRemoteHiddenShare(computerName, hiddenShareName, tempLinkPath, progress), ct);
+            vssShareCreated = true;
+            ct.ThrowIfCancellationRequested();
+
+            // ── Step 6d: Validate share is accessible from server ─────────────────
+            var uncSource = $"\\\\{computerName}\\{hiddenShareName}";
             Log(progress, "INFO", $"Validating server-side access to {uncSource}...");
             bool pathAccessible = false;
             for (int attempt = 1; attempt <= 5; attempt++)
@@ -352,24 +353,23 @@ public class BackupOrchestrator
                     if (Directory.Exists(uncSource))
                     {
                         pathAccessible = true;
-                        Log(progress, "SUCCESS", $"Remote VSS path accessible on attempt {attempt}.");
+                        Log(progress, "SUCCESS", $"Remote VSS share accessible on attempt {attempt}.");
                         break;
                     }
                 }
                 catch { /* ignore transient access errors */ }
 
-                Log(progress, "INFO", $"Path not yet accessible (attempt {attempt}/5), waiting 2s...");
+                Log(progress, "INFO", $"Share not yet accessible (attempt {attempt}/5), waiting 2s...");
                 await Task.Delay(2000, ct);
             }
             if (!pathAccessible)
             {
                 throw new Exception(
                     $"Cannot access {uncSource} after 5 attempts. " +
-                    "Verify R2L symlink evaluation is enabled on both server and client. " +
-                    "Run: fsutil behavior set symlinkevaluation R2L:1");
+                    "The hidden share on the client may not have been created properly.");
             }
 
-            // ── Step 7c: Server-pull robocopy from client admin share → local VHDX ──
+            // ── Step 7: Server-pull robocopy from client share → local VHDX ──────
             Log(progress, "INFO", $"Copying data: {uncSource} → {vhdxDriveLetter}:\\");
             Log(progress, "INFO", "This may take a while depending on data size. Please wait...");
             await RunLocalDataCopy(uncSource, $"{vhdxDriveLetter}:\\", computerName, progress, ct);
@@ -387,7 +387,15 @@ public class BackupOrchestrator
         }
         finally
         {
-            // ── Step 7d: Remove VSS symlink on remote client ─────────────────────
+            // ── Step 8a: Remove hidden share on remote client ────────────────────
+            if (vssShareCreated)
+            {
+                Log(progress, "INFO", "Cleaning up remote hidden share...");
+                try { await Task.Run(() => RemoveRemoteHiddenShare(computerName, "adshield_backup$", progress)); }
+                catch (Exception ex) { progress.Report($"[WARN] Could not remove hidden share: {ex.Message}"); }
+            }
+
+            // ── Step 8b: Remove VSS symlink on remote client ─────────────────────
             if (vssSymlinkCreated)
             {
                 Log(progress, "INFO", "Cleaning up remote VSS symbolic link...");
@@ -395,7 +403,7 @@ public class BackupOrchestrator
                 catch (Exception ex) { progress.Report($"[WARN] Could not remove VSS symlink: {ex.Message}"); }
             }
 
-            // ── Step 7e: Delete VSS shadow copy ──────────────────────────────────
+            // ── Step 8c: Delete VSS shadow copy ──────────────────────────────────
             if (shadowId != null)
             {
                 Log(progress, "INFO", "Cleaning up remote VSS shadow copy...");
@@ -403,7 +411,7 @@ public class BackupOrchestrator
                 catch (Exception ex) { progress.Report($"[WARN] Could not delete shadow copy: {ex.Message}"); }
             }
 
-            // ── Step 8: Cleanup — detach VHDX locally ────────────────────────────
+            // ── Step 8d: Cleanup — detach VHDX locally ───────────────────────────
             if (vhdxMounted)
             {
                 Log(progress, "INFO", "Unmounting VHDX locally...");
@@ -759,9 +767,42 @@ public class BackupOrchestrator
     }
 
     /// <summary>
-    /// Runs robocopy locally on the backup server, pulling data from the client's admin share
-    /// (which traverses the VSS symlink via R2L evaluation) to the locally mounted VHDX drive.
-    /// This eliminates the Kerberos double-hop problem entirely — single network hop only.
+    /// Creates a hidden SMB share on the remote client via WMI, pointing to the VSS symlink folder.
+    /// The SMB server on the client resolves the symlink locally when serving files, avoiding the
+    /// problem where remote SMB clients cannot traverse symlinks to VSS device paths through C$.
+    /// </summary>
+    private static void CreateRemoteHiddenShare(
+        string computerName,
+        string shareName,
+        string localPath,
+        IProgress<string> progress)
+    {
+        // Remove any stale share first
+        try { RemoveRemoteHiddenShare(computerName, shareName, progress); }
+        catch { /* ignore if share doesn't exist */ }
+
+        var cmd = $"cmd.exe /c net share {shareName}={localPath} /GRANT:Everyone,READ";
+        RunRemoteWmiCommand(computerName, cmd, 15000);
+        Log(progress, "SUCCESS", $"Hidden share \\\\{computerName}\\{shareName} created.");
+    }
+
+    /// <summary>
+    /// Removes the hidden backup share from the remote client.
+    /// </summary>
+    private static void RemoveRemoteHiddenShare(
+        string computerName,
+        string shareName,
+        IProgress<string> progress)
+    {
+        RunRemoteWmiCommand(computerName, $"cmd.exe /c net share {shareName} /DELETE /Y", 10000);
+        Log(progress, "INFO", $"Hidden share {shareName} removed from {computerName}.");
+    }
+
+    /// <summary>
+    /// Runs robocopy locally on the backup server, pulling data from the client's hidden backup share
+    /// (which exposes the VSS symlink folder) to the locally mounted VHDX drive.
+    /// The SMB server on the client resolves the symlink locally, so no R2L traversal is needed.
+    /// This eliminates the Kerberos double-hop problem — single network hop only.
     /// </summary>
     private async Task RunLocalDataCopy(
         string uncSource,

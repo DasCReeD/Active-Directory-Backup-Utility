@@ -129,10 +129,14 @@ namespace ADShield.Core
         public static async Task TestVssSymlinkAccess(string computerName, IProgress<string> progress, CancellationToken ct)
         {
             progress.Report("[TEST] ═══════════════════════════════════════════════════════════");
-            progress.Report("[TEST] Test 2: VSS Symlink Creation + Server-Pull Access");
+            progress.Report("[TEST] Test 2: VSS Symlink + Hidden Share Server-Pull Access");
             progress.Report("[TEST] ═══════════════════════════════════════════════════════════");
 
             string? shadowId = null;
+            bool symlinkCreated = false;
+            bool shareCreated = false;
+            var tempLinkPath = @"C:\adshield_test_link";
+            var hiddenShareName = "adshield_test_share$";
 
             try
             {
@@ -171,7 +175,6 @@ namespace ADShield.Core
                 progress.Report($"[TEST] [PASS] Shadow device: {shadowDevicePath}");
 
                 // Step 4: Create symlink on remote client via WMI
-                var tempLinkPath = @"C:\adshield_test_link";
                 progress.Report($"[TEST] Creating symlink on {computerName}: {tempLinkPath} → {shadowDevicePath}");
 
                 // Clean up any stale link
@@ -179,10 +182,20 @@ namespace ADShield.Core
                 catch { }
 
                 RunTestWmiCommand(computerName, scope, $"cmd.exe /c mklink /d {tempLinkPath} {shadowDevicePath}", 15000);
+                symlinkCreated = true;
                 progress.Report("[TEST] [PASS] Remote symlink created.");
 
-                // Step 5: Attempt server-pull access via admin share
-                var uncPath = $@"\\{computerName}\C$\adshield_test_link";
+                // Step 4b: Create hidden share on remote client via WMI
+                progress.Report($"[TEST] Creating remote hidden share: {hiddenShareName} → {tempLinkPath}");
+                try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c net share {hiddenShareName} /DELETE /Y", 10000); }
+                catch { }
+
+                RunTestWmiCommand(computerName, scope, $"cmd.exe /c net share {hiddenShareName}={tempLinkPath} /GRANT:Everyone,READ", 15000);
+                shareCreated = true;
+                progress.Report("[TEST] [PASS] Remote hidden share created.");
+
+                // Step 5: Attempt server-pull access via hidden share
+                var uncPath = $@"\\{computerName}\{hiddenShareName}";
                 progress.Report($"[TEST] Attempting server-side directory listing of: {uncPath}");
 
                 try
@@ -205,18 +218,32 @@ namespace ADShield.Core
                 catch (Exception ex)
                 {
                     progress.Report($"[TEST] [FAIL] Server-pull access failed: {ex.Message}");
-                    progress.Report("[TEST] This likely means R2L symlink evaluation is not enabled on the client.");
-                    progress.Report("[TEST] Run Test 1 first to enable it, or set via Group Policy.");
                     throw;
                 }
-
-                // Step 6: Cleanup symlink
-                progress.Report("[TEST] Cleaning up test symlink...");
-                try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c rmdir {tempLinkPath}", 10000); }
-                catch (Exception ex) { progress.Report($"[TEST] [WARN] Cleanup failed: {ex.Message}"); }
             }
             finally
             {
+                var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
+                scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
+                scope.Options.EnablePrivileges = true;
+                scope.Connect();
+
+                // Cleanup share
+                if (shareCreated)
+                {
+                    progress.Report("[TEST] Cleaning up test hidden share...");
+                    try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c net share {hiddenShareName} /DELETE /Y", 10000); }
+                    catch (Exception ex) { progress.Report($"[TEST] [WARN] Share cleanup failed: {ex.Message}"); }
+                }
+
+                // Cleanup symlink
+                if (symlinkCreated)
+                {
+                    progress.Report("[TEST] Cleaning up test symlink...");
+                    try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c rmdir {tempLinkPath}", 10000); }
+                    catch (Exception ex) { progress.Report($"[TEST] [WARN] Symlink cleanup failed: {ex.Message}"); }
+                }
+
                 // Always clean up VSS shadow
                 if (shadowId != null)
                 {
@@ -237,7 +264,7 @@ namespace ADShield.Core
         public static async Task TestEndToEndServerPull(string computerName, IProgress<string> progress, CancellationToken ct)
         {
             progress.Report("[TEST] ═══════════════════════════════════════════════════════════");
-            progress.Report("[TEST] Test 3: End-to-End Server-Pull Robocopy");
+            progress.Report("[TEST] Test 3: End-to-End Server-Pull Robocopy via Hidden Share");
             progress.Report("[TEST] ═══════════════════════════════════════════════════════════");
 
             var testDriveLetter = "T";
@@ -246,7 +273,9 @@ namespace ADShield.Core
             string? shadowId = null;
             bool vhdxMounted = false;
             bool symlinkCreated = false;
+            bool shareCreated = false;
             var tempLinkPath = @"C:\adshield_pull_test_link";
+            var hiddenShareName = "adshield_pull_test_share$";
 
             // Setup
             Directory.CreateDirectory(testFolder);
@@ -305,8 +334,16 @@ namespace ADShield.Core
                 symlinkCreated = true;
                 progress.Report("[TEST] [PASS] VSS symlink created.");
 
-                // Step 5: Run server-pull robocopy
-                var uncSource = $@"\\{computerName}\C$\adshield_pull_test_link";
+                // Step 4b: Create hidden share on client
+                progress.Report("[TEST] 4b. Creating hidden share on client...");
+                try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c net share {hiddenShareName} /DELETE /Y", 10000); }
+                catch { }
+                RunTestWmiCommand(computerName, scope, $"cmd.exe /c net share {hiddenShareName}={tempLinkPath} /GRANT:Everyone,READ", 15000);
+                shareCreated = true;
+                progress.Report("[TEST] [PASS] Hidden share created.");
+
+                // Step 5: Run server-pull robocopy (NO /B flag to avoid privilege issues on target)
+                var uncSource = $@"\\{computerName}\{hiddenShareName}";
                 var logFile = Path.Combine(Path.GetTempPath(), "adshield_pull_test_robocopy.log");
 
                 progress.Report($"[TEST] 5. Running server-pull robocopy: {uncSource} → {testDriveLetter}:\\");
@@ -314,8 +351,7 @@ namespace ADShield.Core
                 // Only copy the top-level Windows directory listing (skip deep recursion for speed)
                 var robocopyArgs =
                     $"\"{uncSource}\\Windows\" \"{testDriveLetter}:\\Windows\" " +
-                    "/E /COPY:DAT /B /R:0 /W:0 /NP /XJ /LEV:1 " +
-                    "/XD \"System Volume Information\" \"$Recycle.Bin\" " +
+                    "ntbtlog.txt /R:0 /W:0 /NP /XJ " +
                     $"/LOG:\"{logFile}\"";
 
                 var psi = new System.Diagnostics.ProcessStartInfo("robocopy.exe", robocopyArgs)
@@ -335,7 +371,16 @@ namespace ADShield.Core
                 progress.Report($"[TEST] Robocopy exit code: {proc.ExitCode}");
 
                 if (proc.ExitCode >= 8)
+                {
+                    if (File.Exists(logFile))
+                    {
+                        progress.Report("[TEST] Robocopy log output:");
+                        var logLines = await File.ReadAllLinesAsync(logFile, ct);
+                        foreach (var line in logLines)
+                            progress.Report($"[TEST]   {line}");
+                    }
                     throw new Exception($"Robocopy failed with exit code {proc.ExitCode}");
+                }
 
                 // Step 6: Verify files were copied
                 progress.Report("[TEST] 6. Verifying data was copied to VHDX...");
@@ -357,17 +402,22 @@ namespace ADShield.Core
             }
             finally
             {
+                var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
+                scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
+                scope.Options.EnablePrivileges = true;
+                scope.Connect();
+
+                // Cleanup: share
+                if (shareCreated)
+                {
+                    try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c net share {hiddenShareName} /DELETE /Y", 10000); }
+                    catch (Exception ex) { progress.Report($"[TEST] [WARN] Share cleanup failed: {ex.Message}"); }
+                }
+
                 // Cleanup: symlink
                 if (symlinkCreated)
                 {
-                    try
-                    {
-                        var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
-                        scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
-                        scope.Options.EnablePrivileges = true;
-                        scope.Connect();
-                        RunTestWmiCommand(computerName, scope, $"cmd.exe /c rmdir {tempLinkPath}", 10000);
-                    }
+                    try { RunTestWmiCommand(computerName, scope, $"cmd.exe /c rmdir {tempLinkPath}", 10000); }
                     catch (Exception ex) { progress.Report($"[TEST] [WARN] Symlink cleanup failed: {ex.Message}"); }
                 }
 
