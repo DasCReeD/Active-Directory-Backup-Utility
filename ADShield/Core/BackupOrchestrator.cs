@@ -207,7 +207,7 @@ public class BackupOrchestrator
                 initScript =
                     $"select vdisk file=\"{vhdxPath}\"\r\n" +
                     $"online disk NOERR\r\n" +
-                    $"select partition 1\r\n" +
+                    $"select partition 2\r\n" +
                     $"assign letter={vhdxDriveLetter} NOERR\r\n";
             }
 
@@ -823,7 +823,7 @@ public class BackupOrchestrator
         // /LOG = write results to log file
         var robocopyArgs =
             $"\"{uncSource}\" \"{localDest}\" " +
-            "/E /COPY:DAT /B /R:1 /W:1 /NP /XJ " +
+            "/E /COPY:DAT /R:1 /W:1 /NP /XJ " +
             "/XD \"System Volume Information\" \"$Recycle.Bin\" \"$WinREAgent\" Recovery " +
             $"/LOG:\"{logFile}\"";
 
