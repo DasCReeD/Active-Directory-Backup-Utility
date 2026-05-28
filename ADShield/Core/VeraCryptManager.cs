@@ -46,14 +46,43 @@ public static class VeraCryptManager
 
         using var proc = System.Diagnostics.Process.Start(psi)
             ?? throw new Exception("Failed to start VeraCrypt process.");
-        proc.WaitForExit(60_000); // 60s for network volumes
 
-        if (!IsMounted(settings.MountLetter))
+        bool exited = proc.WaitForExit(90_000); // 90s for network volumes
+
+        if (!exited)
+        {
+            try { proc.Kill(); } catch { }
             throw new Exception(
-                $"VeraCrypt mount did not succeed.\n" +
+                $"VeraCrypt mount timed out after 90 seconds.\n" +
+                $"Container: {containerPath}\n" +
+                "The network share may be slow or unreachable.");
+        }
+
+        if (proc.ExitCode != 0)
+        {
+            progress?.Report($"[WARN] VeraCrypt exited with code {proc.ExitCode}. Waiting for drive registration...");
+        }
+
+        // Network-hosted containers can take a few seconds after VeraCrypt exits
+        // before Windows fully registers the drive letter. Poll for up to 10s.
+        bool mounted = false;
+        for (int attempt = 1; attempt <= 10; attempt++)
+        {
+            if (IsMounted(settings.MountLetter))
+            {
+                mounted = true;
+                break;
+            }
+            progress?.Report($"[INFO] Waiting for drive {settings.MountLetter}: to register (attempt {attempt}/10)...");
+            Thread.Sleep(1000);
+        }
+
+        if (!mounted)
+            throw new Exception(
+                $"VeraCrypt mount did not succeed (exit code {proc.ExitCode}).\n" +
                 $"Container: {containerPath}\n" +
                 $"Drive letter: {settings.MountLetter}\n" +
-                "Check the passphrase and that the container file exists.");
+                "Check the passphrase and that the container file exists on the network.");
 
         progress?.Report($"[SUCCESS] VeraCrypt container mounted at {settings.MountLetter}:");
     }
