@@ -813,29 +813,25 @@ public class BackupOrchestrator
     {
         var logFile = Path.Combine(Path.GetTempPath(), $"adshield_robocopy_{computerName}.log");
 
-        // /E = copy subdirectories including empty ones
-        // /COPY:DAT = copy Data, Attributes, Timestamps
-        // /B = backup mode (uses SeBackupPrivilege to bypass ACLs)
-        // /R:1 /W:1 = retry once, wait 1 second
-        // /NP = no progress percentage
-        // /XJ = exclude junction points to avoid infinite loops
-        // /XD = exclude directories that shouldn't be copied
-        // /LOG = write results to log file
-        var robocopyArgs =
-            $"\"{uncSource}\" \"{localDest}\" " +
-            "/E /COPY:DAT /R:1 /W:1 /NP /XJ " +
-            "/XD \"System Volume Information\" \"$Recycle.Bin\" \"$WinREAgent\" Recovery " +
-            $"/LOG:\"{logFile}\"";
-
-        Log(progress, "INFO", $"Server-pull robocopy: robocopy {robocopyArgs}");
-
-        var psi = new System.Diagnostics.ProcessStartInfo("robocopy.exe", robocopyArgs)
+        // ArgumentList handles quoting automatically — prevents path\backslash breakage
+        // (same pattern as VeraCryptManager.cs; eliminates the class of \" escape bugs)
+        var psi = new System.Diagnostics.ProcessStartInfo("robocopy.exe")
         {
             CreateNoWindow = true,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
+        foreach (var arg in new[]
+        {
+            uncSource, localDest,
+            "/E", "/COPY:DAT", "/R:1", "/W:1", "/NP", "/XJ",
+            "/XD", "System Volume Information", "$Recycle.Bin", "$WinREAgent", "Recovery",
+            $"/LOG:{logFile}"
+        })
+            psi.ArgumentList.Add(arg);
+
+        Log(progress, "INFO", $"Server-pull robocopy: robocopy {string.Join(" ", psi.ArgumentList)}");
 
         using var proc = System.Diagnostics.Process.Start(psi);
         if (proc == null)
@@ -888,7 +884,9 @@ public class BackupOrchestrator
         // Exit code 8+ means a real failure
         if (proc.ExitCode >= 8)
         {
-            throw new Exception($"Robocopy failed with exit code {proc.ExitCode}. Stderr: {stderr.Trim()}");
+            throw new Exception(
+                $"Robocopy failed with exit code {proc.ExitCode}. " +
+                $"Stdout: {stdout.Trim()} Stderr: {stderr.Trim()}");
         }
     }
 
