@@ -170,8 +170,9 @@ public partial class MainForm : Form
         var buttonsFlow = new FlowLayoutPanel
         {
             FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
             AutoSize = true,
-            Anchor = AnchorStyles.Right | AnchorStyles.Top,
+            Anchor = AnchorStyles.Right,
             Padding = Padding.Empty, Margin = Padding.Empty
         };
         buttonsFlow.Controls.AddRange(new Control[] { btnTest, btnRescan, btnSync });
