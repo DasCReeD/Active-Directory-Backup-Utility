@@ -25,6 +25,10 @@ public class AppSettings
 
     public bool DomainAdminContext { get; set; } = true;
 
+    // ── Client Agent Connection Settings
+    public int    AgentPort   { get; set; } = 9099;
+    public string AgentApiKey { get; set; } = "ADShieldDefaultApiKeySecret_ChangeMe";
+
     // Computed helper: full path to backup root on the mounted drive
     public string BackupRootPath =>
         System.IO.Path.Combine($"{MountLetter}:\\", BackupStorageRoot);

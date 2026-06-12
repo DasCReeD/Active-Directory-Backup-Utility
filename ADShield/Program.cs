@@ -2,6 +2,9 @@ using ADShield.Forms;
 using ADShield.Core;
 using ADShield.Models;
 using System.Runtime.InteropServices;
+using System.ServiceProcess;
+using System.Diagnostics;
+using Newtonsoft.Json;
 
 namespace ADShield;
 
@@ -25,6 +28,12 @@ internal static class Program
     [STAThread]
     static async Task Main(string[] args)
     {
+        if (args.Length > 0 && args[0].Equals("--service", StringComparison.OrdinalIgnoreCase))
+        {
+            ServiceBase.Run(new AgentService());
+            return;
+        }
+
         if (args.Length > 0)
         {
             try
@@ -212,15 +221,144 @@ internal static class Program
                     await BackupSelfHealingTest.RunDiagnosticTest(progress, CancellationToken.None);
                     break;
                 }
+            case "install":
+            case "--install":
+            case "-i":
+                {
+                    string portStr = GetParam("port", "9099");
+                    string key = GetParam("key", "ADShieldDefaultApiKeySecret_ChangeMe");
+                    string server = GetParam("server", "");
+                    int port = 9099;
+                    int.TryParse(portStr, out port);
+
+                    InstallAgentService(port, key, server);
+                    break;
+                }
+            case "uninstall":
+            case "--uninstall":
+            case "-u":
+                {
+                    UninstallAgentService();
+                    break;
+                }
             default:
                 PrintHelp();
                 break;
         }
     }
 
+    private static void InstallAgentService(int port, string key, string serverIp)
+    {
+        Console.WriteLine("Installing ADShield client Windows Service...");
+        
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+        {
+            Console.WriteLine("[ERROR] Could not resolve process path.");
+            return;
+        }
+
+        var exeDir = Path.GetDirectoryName(exePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+        var configPath = Path.Combine(exeDir, "agent_config.json");
+
+        try
+        {
+            // Write agent_config.json
+            var config = new AgentConfig { Port = port, ApiKey = key, AllowedServerIp = serverIp };
+            File.WriteAllText(configPath, JsonConvert.SerializeObject(config, Formatting.Indented));
+            Console.WriteLine($"Wrote configuration to {configPath}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERROR] Failed to write config: {ex.Message}");
+            return;
+        }
+
+        // Install service using sc.exe
+        var binPath = $"\\\"{exePath}\\\" --service";
+        RunSystemProcess("sc.exe", $"create ADShieldAgent binPath= \"{binPath}\" start= auto DisplayName= \"ADShield Backup Agent\"");
+
+        // Configure Firewall
+        string firewallArgs = $"advfirewall firewall add rule name=\"ADShield Agent\" dir=in action=allow protocol=TCP localport={port}";
+        if (!string.IsNullOrEmpty(serverIp))
+        {
+            firewallArgs += $" remoteip={serverIp}";
+        }
+        RunSystemProcess("netsh.exe", firewallArgs);
+
+        // Start service
+        RunSystemProcess("sc.exe", "start ADShieldAgent");
+
+        Console.WriteLine("\nService installation process complete.");
+    }
+
+    private static void UninstallAgentService()
+    {
+        Console.WriteLine("Uninstalling ADShield client Windows Service...");
+
+        // Stop and Delete service
+        RunSystemProcess("sc.exe", "stop ADShieldAgent");
+        RunSystemProcess("sc.exe", "delete ADShieldAgent");
+
+        // Remove Firewall exception
+        RunSystemProcess("netsh.exe", "advfirewall firewall delete rule name=\"ADShield Agent\"");
+
+        // Clean up config file
+        try
+        {
+            var exePath = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(exePath))
+            {
+                var exeDir = Path.GetDirectoryName(exePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                var configPath = Path.Combine(exeDir, "agent_config.json");
+                if (File.Exists(configPath))
+                {
+                    File.Delete(configPath);
+                    Console.WriteLine($"Removed configuration file: {configPath}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARNING] Failed to remove config file: {ex.Message}");
+        }
+
+        Console.WriteLine("\nService uninstallation process complete.");
+    }
+
+    private static void RunSystemProcess(string fileName, string arguments)
+    {
+        Console.WriteLine($"\n> Executing: {fileName} {arguments}");
+        try
+        {
+            var psi = new ProcessStartInfo(fileName, arguments)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null)
+            {
+                Console.WriteLine("[ERROR] Failed to start process.");
+                return;
+            }
+            proc.WaitForExit();
+            string output = proc.StandardOutput.ReadToEnd();
+            string error = proc.StandardError.ReadToEnd();
+            if (!string.IsNullOrWhiteSpace(output)) Console.WriteLine(output.Trim());
+            if (!string.IsNullOrWhiteSpace(error)) Console.WriteLine($"[ERROR] {error.Trim()}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[EXCEPTION] {ex.Message}");
+        }
+    }
+
     private static void PrintHelp()
     {
-        Console.WriteLine("ADShield — Active Directory Agentless Backup Utility (CLI Mode)");
+        Console.WriteLine("ADShield — Active Directory Agent-Based Backup Utility (CLI Mode)");
         Console.WriteLine("\nUsage:");
         Console.WriteLine("  ADShield.exe <action> [parameters]");
         Console.WriteLine("\nActions:");
@@ -236,5 +374,8 @@ internal static class Program
         Console.WriteLine("                     Parameters: [--ou <OU>] [--group <Group>]");
         Console.WriteLine("  --test, -ts        Run backup logic test suite");
         Console.WriteLine("  --diagnostics, -dg Run VHDX self-healing diagnostics");
+        Console.WriteLine("  --install, -i      Install this binary as a Windows Service client on target computer");
+        Console.WriteLine("                     Parameters: [--port <port>] [--key <key>] [--server <serverIp>]");
+        Console.WriteLine("  --uninstall, -u    Stop and remove client Windows Service and Firewall rules");
     }
 }

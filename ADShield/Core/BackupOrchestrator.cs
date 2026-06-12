@@ -1,260 +1,214 @@
 using ADShield.Models;
+using System;
+using System.IO;
+using System.Text;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Linq;
 
-namespace ADShield.Core;
-
-/// <summary>
-/// Full agentless backup orchestration using a server-pull architecture:
-/// 1. Verify VeraCrypt volume mounted
-/// 2. Ping target
-/// 3. WMI connectivity check
-/// 4. Ensure per-machine folder + VHDX on server
-/// 5. Mount VHDX locally and initialize NTFS
-/// 6. Trigger remote VSS shadow copy, create symlink on client
-/// 7. Run robocopy locally on the server, pulling from client admin share
-/// 8. Cleanup: delete shadow copy, remove symlink, detach VHDX
-/// All steps report progress via IProgress&lt;string&gt;.
-/// </summary>
-public class BackupOrchestrator
+namespace ADShield.Core
 {
-    private readonly AppSettings _settings;
-
     /// <summary>
-    /// Initializes a new instance of <see cref="BackupOrchestrator"/> with the given application settings.
+    /// Full agent-based backup orchestration:
+    /// 1. Verify VeraCrypt volume mounted locally.
+    /// 2. Ping target client computer to verify ICMP connectivity.
+    /// 3. Verify connection to the client ADShield HTTP Agent.
+    /// 4. Prepare local staging directory and VHDX volume.
+    /// 5. Mount VHDX locally on the server.
+    /// 6. Trigger wbadmin system backup via the client agent and poll progress.
+    /// 7. Copy completed staged backup into the local encrypted VHDX using Robocopy.
+    /// 8. Cleanup staging directory and unmount VHDX.
     /// </summary>
-    /// <param name="settings">The loaded <see cref="AppSettings"/> including vault path, mount letter, and storage config.</param>
-    public BackupOrchestrator(AppSettings settings)
+    public class BackupOrchestrator
     {
-        _settings = settings;
-    }
+        private readonly AppSettings _settings;
 
-    /// <summary>
-    /// Executes the complete 8-step agentless backup sequence for a single domain computer.
-    /// </summary>
-    /// <remarks>
-    /// Pipeline steps:
-    /// <list type="number">
-    ///   <item>Mount VeraCrypt vault if not already mounted.</item>
-    ///   <item>ICMP ping the target to confirm reachability.</item>
-    ///   <item>Verify WMI remote access is available.</item>
-    ///   <item>Create per-machine folder and VHDX on the backup server (auto-sized to remote C: usage + 20%).</item>
-    ///   <item>Mount VHDX locally and initialize NTFS (self-heals RAW/unformatted partitions).</item>
-    ///   <item>Create a hidden SMB share pointing to the mounted VHDX drive.</item>
-    ///   <item>Trigger VSS shadow copy on the remote client and run robocopy push via WMI.</item>
-    ///   <item>Cleanup: delete shadow copy, remove SMB share, detach VHDX.</item>
-    /// </list>
-    /// </remarks>
-    /// <param name="computerName">The NetBIOS name of the target domain computer.</param>
-    /// <param name="backupType">The backup type: <c>"Incremental"</c> or <c>"Full"</c>.</param>
-    /// <param name="veraCryptPassword">The VeraCrypt vault passphrase. Held in memory only; never persisted.</param>
-    /// <param name="progress">Receives <c>[LEVEL] message</c> strings throughout execution.</param>
-    /// <param name="ct">Cancellation token to abort the sequence between steps.</param>
-    /// <exception cref="Exception">Thrown on ICMP failure, WMI access denial, robocopy error, or mount failure.</exception>
-    public async Task RunAsync(
-        string computerName,
-        string backupType,
-        string veraCryptPassword,
-        IProgress<string> progress,
-        CancellationToken ct = default)
-    {
-        Log(progress, "INFO", $"Starting {backupType} backup sequence for {computerName}");
-
-        // ── Step 1: Verify VeraCrypt volume ───────────────────────────────────
-        bool isMounted = await Task.Run(() => VeraCryptManager.IsMounted(_settings.MountLetter), ct);
-        if (!isMounted)
+        public BackupOrchestrator(AppSettings settings)
         {
-            Log(progress, "INFO", "VeraCrypt volume not mounted. Attempting to mount...");
-            await Task.Run(() => VeraCryptManager.Mount(_settings, veraCryptPassword, progress), ct);
-        }
-        else
-        {
-            Log(progress, "INFO", $"VeraCrypt volume is ready at {_settings.MountLetter}:");
-        }
-        ct.ThrowIfCancellationRequested();
-
-        // ── Step 2: Ping target ───────────────────────────────────────────────
-        Log(progress, "INFO", $"Pinging {computerName}...");
-        using (var ping = new System.Net.NetworkInformation.Ping())
-        {
-            var reply = await Task.Run(() => ping.Send(computerName, 1500), ct);
-            if (reply.Status != System.Net.NetworkInformation.IPStatus.Success)
-                throw new Exception($"{computerName} is offline or unreachable (ICMP failed).");
-            Log(progress, "INFO", $"Ping OK — {reply.RoundtripTime} ms");
-        }
-        ct.ThrowIfCancellationRequested();
-
-        // ── Step 3: WMI connectivity ──────────────────────────────────────────
-        Log(progress, "INFO", "Verifying WMI remote administration access...");
-        var wmiResult = await Task.Run(() =>
-        {
-            bool success = VssManager.TestWmiConnectivity(computerName, out var err);
-            return (success, err);
-        }, ct);
-        if (!wmiResult.success)
-            throw new Exception($"WMI not accessible on {computerName}: {wmiResult.err}");
-        Log(progress, "SUCCESS", "WMI remote connection verified.");
-        ct.ThrowIfCancellationRequested();
-
-        // ── Step 4: Prepare server-side VHDX & folder ────────────────────────
-        var clientFolder  = Path.Combine(_settings.BackupRootPath, computerName);
-        var vhdxPath      = Path.Combine(clientFolder, "disk.vhdx");
-
-        Log(progress, "INFO", $"Configuring storage at {clientFolder}...");
-        Directory.CreateDirectory(clientFolder);
-
-        // Grant explicit permissions to Everyone, Authenticated Users, Domain Computers, and target computer account
-        try
-        {
-            var domain = Environment.UserDomainName;
-            var commands = new System.Collections.Generic.List<string>
-            {
-                $"\"{clientFolder}\" /grant Everyone:(OI)(CI)F /T",
-                $"\"{clientFolder}\" /grant *S-1-5-11:(OI)(CI)F /T" // Well-known SID for Authenticated Users (language-independent)
-            };
-
-            if (!string.IsNullOrEmpty(domain))
-            {
-                commands.Add($"\"{clientFolder}\" /grant \"{domain}\\Domain Computers\":(OI)(CI)F /T");
-                commands.Add($"\"{clientFolder}\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
-            }
-
-            await Task.Run(() =>
-            {
-                foreach (var args in commands)
-                {
-                    var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
-                    {
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    };
-                    using var proc = System.Diagnostics.Process.Start(psi);
-                    proc?.WaitForExit();
-                }
-            }, ct);
-        }
-        catch (Exception ex)
-        {
-            Log(progress, "WARN", $"Could not set NTFS permissions on client folder: {ex.Message}");
+            _settings = settings;
         }
 
-        bool isNewVhdx = false;
-        if (!VhdxManager.VhdxExists(vhdxPath))
+        public async Task RunAsync(
+            string computerName,
+            string backupType,
+            string veraCryptPassword,
+            IProgress<string> progress,
+            CancellationToken ct = default)
         {
-            isNewVhdx = true;
-            // Query the remote machine's C: drive used space to size the VHDX appropriately
-            long vhdxSizeGb = _settings.VhdxSizeGb; // fallback to config
-            try
+            Log(progress, "INFO", $"Starting {backupType} backup sequence for {computerName} (Agent-Based)");
+
+            // ── Step 1: Verify VeraCrypt volume ───────────────────────────────────
+            bool isMounted = await Task.Run(() => VeraCryptManager.IsMounted(_settings.MountLetter), ct);
+            if (!isMounted)
             {
-                var (usedGb, totalGb) = GetRemoteDiskUsage(computerName, @"C:");
-                // Size VHDX to used space + 20% headroom, minimum 10 GB
-                vhdxSizeGb = Math.Max(10, (long)Math.Ceiling(usedGb * 1.2));
-                Log(progress, "INFO", $"Remote C: drive: {usedGb:F1} GB used / {totalGb:F1} GB total");
-                Log(progress, "INFO", $"VHDX will be sized to {vhdxSizeGb} GB (used + 20% headroom)");
-            }
-            catch (Exception ex)
-            {
-                Log(progress, "WARN", $"Could not query remote disk usage: {ex.Message}");
-                Log(progress, "INFO", $"Falling back to configured size: {vhdxSizeGb} GB");
-            }
-
-            // Verify the VeraCrypt container has enough free space
-            try
-            {
-                var mountDrive = new DriveInfo(_settings.MountLetter + ":\\");
-                var freeGb = mountDrive.AvailableFreeSpace / (1024.0 * 1024 * 1024);
-                if (freeGb < vhdxSizeGb)
-                {
-                    Log(progress, "WARN", $"VeraCrypt volume has {freeGb:F1} GB free but VHDX needs {vhdxSizeGb} GB");
-                    vhdxSizeGb = Math.Max(10, (long)Math.Floor(freeGb * 0.9));
-                    Log(progress, "INFO", $"Reducing VHDX size to {vhdxSizeGb} GB to fit available space");
-                }
-            }
-            catch { /* drive info unavailable — proceed with calculated size */ }
-
-            Log(progress, "INFO", $"Creating {vhdxSizeGb} GB VHDX at {vhdxPath}...");
-            ulong sizeBytes = (ulong)vhdxSizeGb * 1024 * 1024 * 1024;
-            await Task.Run(() => VhdxManager.CreateVhdx(vhdxPath, sizeBytes, progress: progress), ct);
-        }
-        else
-        {
-            Log(progress, "INFO", "Existing VHDX container found.");
-        }
-        ct.ThrowIfCancellationRequested();
-
-        bool vhdxMounted = false;
-        bool taskRegistered = false;
-        var vhdxDriveLetter = "B"; // temp letter for the VHDX locally on the backup server
-        var taskName = "ADShield_Backup_Run";
-        var remoteStateFile = @"C:\Windows\Temp\adshield_task_state.txt";
-        var remoteResultFile = @"C:\Windows\Temp\adshield_task_result.txt";
-        var tempBackupDir = Path.Combine(@"E:\adshield_temp", computerName);
-
-        try
-        {
-            // ── Step 5: Mount VHDX locally on the backup server ─────────────────
-            Log(progress, "INFO", $"Mounting VHDX locally at {vhdxPath}...");
-            var mountScript = $"select vdisk file=\"{vhdxPath}\"\r\nattach vdisk";
-            await RunLocalDiskpart(mountScript, progress, ct);
-            vhdxMounted = true;
-            Log(progress, "SUCCESS", "VHDX mounted locally.");
-            ct.ThrowIfCancellationRequested();
-
-            // ── Step 6: Initialize VHDX locally (partition, format, assign letter) ──
-            string initScript;
-
-            if (isNewVhdx)
-            {
-                Log(progress, "INFO", $"Initializing fresh local VHDX — partitioning, formatting, and assigning drive {vhdxDriveLetter}:...");
-                initScript =
-                    $"select vdisk file=\"{vhdxPath}\"\r\n" +
-                    $"clean\r\n" +
-                    $"convert gpt\r\n" +
-                    $"create partition primary\r\n" +
-                    $"format fs=ntfs label=\"ADShield\" quick\r\n" +
-                    $"assign letter={vhdxDriveLetter} NOERR\r\n";
+                Log(progress, "INFO", "VeraCrypt volume not mounted. Attempting to mount...");
+                await Task.Run(() => VeraCryptManager.Mount(_settings, veraCryptPassword, progress), ct);
             }
             else
             {
-                Log(progress, "INFO", $"Mounting existing local VHDX — assigning drive {vhdxDriveLetter}:...");
-                initScript =
-                    $"select vdisk file=\"{vhdxPath}\"\r\n" +
-                    $"online disk NOERR\r\n" +
-                    $"select partition 2\r\n" +
-                    $"assign letter={vhdxDriveLetter} NOERR\r\n";
+                Log(progress, "INFO", $"VeraCrypt volume is ready at {_settings.MountLetter}:");
             }
+            ct.ThrowIfCancellationRequested();
 
-            await RunLocalDiskpart(initScript, progress, ct);
+            // ── Step 2: Ping target ───────────────────────────────────────────────
+            Log(progress, "INFO", $"Pinging {computerName}...");
+            using (var ping = new System.Net.NetworkInformation.Ping())
+            {
+                var reply = await Task.Run(() => ping.Send(computerName, 1500), ct);
+                if (reply.Status != System.Net.NetworkInformation.IPStatus.Success)
+                    throw new Exception($"{computerName} is offline or unreachable (ICMP failed).");
+                Log(progress, "INFO", $"Ping OK — {reply.RoundtripTime} ms");
+            }
+            ct.ThrowIfCancellationRequested();
 
-            // Self-heal: Verify if drive B: exists and is fully formatted/writable.
-            // If not (uninitialized/RAW disk), clean, partition, and format it.
-            bool isWritable = false;
+            // ── Step 3: Verify client Agent is listening ──────────────────────────
+            Log(progress, "INFO", $"Verifying connection to ADShield agent on {computerName}:{_settings.AgentPort}...");
+            AgentStatusResponse? agentStatus = null;
             try
             {
-                if (Directory.Exists($"{vhdxDriveLetter}:\\"))
-                {
-                    var testFile = Path.Combine($"{vhdxDriveLetter}:\\", "adshield_write_test.txt");
-                    File.WriteAllText(testFile, "test");
-                    File.Delete(testFile);
-                    isWritable = true;
-                }
+                agentStatus = await Task.Run(() => GetAgentStatus(computerName, progress), ct);
             }
-            catch
+            catch (Exception ex)
             {
-                isWritable = false;
+                throw new Exception($"Could not connect to ADShield agent on {computerName} (port {_settings.AgentPort}): {ex.Message}");
             }
 
-            if (!isWritable)
+            if (agentStatus == null)
             {
-                Log(progress, "WARN", $"Drive {vhdxDriveLetter}:\\ is not writable or unformatted. Re-initializing partition and formatting NTFS...");
-                var recoveryScript =
-                    $"select vdisk file=\"{vhdxPath}\"\r\n" +
-                    $"clean\r\n" +
-                    $"convert gpt\r\n" +
-                    $"create partition primary\r\n" +
-                    $"format fs=ntfs label=\"ADShield\" quick\r\n" +
-                    $"assign letter={vhdxDriveLetter} NOERR\r\n";
-                await RunLocalDiskpart(recoveryScript, progress, ct);
-                
-                // Verify again after recovery
+                throw new Exception($"Could not retrieve status from ADShield agent on {computerName}.");
+            }
+            Log(progress, "SUCCESS", $"ADShield agent connection verified (Status: {agentStatus.Status}).");
+            ct.ThrowIfCancellationRequested();
+
+            // ── Step 4: Prepare server-side VHDX & folder ────────────────────────
+            var clientFolder  = Path.Combine(_settings.BackupRootPath, computerName);
+            var vhdxPath      = Path.Combine(clientFolder, "disk.vhdx");
+
+            Log(progress, "INFO", $"Configuring storage at {clientFolder}...");
+            Directory.CreateDirectory(clientFolder);
+
+            // Grant explicit permissions to Everyone, Authenticated Users, Domain Computers, and target computer account
+            try
+            {
+                var domain = Environment.UserDomainName;
+                var commands = new System.Collections.Generic.List<string>
+                {
+                    $"\"{clientFolder}\" /grant Everyone:(OI)(CI)F /T",
+                    $"\"{clientFolder}\" /grant *S-1-5-11:(OI)(CI)F /T" // Well-known SID for Authenticated Users (language-independent)
+                };
+
+                if (!string.IsNullOrEmpty(domain))
+                {
+                    commands.Add($"\"{clientFolder}\" /grant \"{domain}\\Domain Computers\":(OI)(CI)F /T");
+                    commands.Add($"\"{clientFolder}\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
+                }
+
+                await Task.Run(() =>
+                {
+                    foreach (var args in commands)
+                    {
+                        var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                        {
+                            CreateNoWindow = true,
+                            UseShellExecute = false
+                        };
+                        using var proc = System.Diagnostics.Process.Start(psi);
+                        proc?.WaitForExit();
+                    }
+                }, ct);
+            }
+            catch (Exception ex)
+            {
+                Log(progress, "WARN", $"Could not set NTFS permissions on client folder: {ex.Message}");
+            }
+
+            bool isNewVhdx = false;
+            if (!VhdxManager.VhdxExists(vhdxPath))
+            {
+                isNewVhdx = true;
+                // Query the remote machine's C: drive used space to size the VHDX appropriately
+                long vhdxSizeGb = _settings.VhdxSizeGb; // fallback to config
+                if (agentStatus != null && agentStatus.TotalGb > 0)
+                {
+                    double usedGb = agentStatus.UsedGb;
+                    double totalGb = agentStatus.TotalGb;
+                    // Size VHDX to used space + 20% headroom, minimum 10 GB
+                    vhdxSizeGb = Math.Max(10, (long)Math.Ceiling(usedGb * 1.2));
+                    Log(progress, "INFO", $"Remote C: drive: {usedGb:F1} GB used / {totalGb:F1} GB total");
+                    Log(progress, "INFO", $"VHDX will be sized to {vhdxSizeGb} GB (used + 20% headroom)");
+                }
+                else
+                {
+                    Log(progress, "WARN", "Could not retrieve remote disk usage. Falling back to configured size.");
+                }
+
+                // Verify the VeraCrypt container has enough free space
+                try
+                {
+                    var mountDrive = new DriveInfo(_settings.MountLetter + ":\\");
+                    var freeGb = mountDrive.AvailableFreeSpace / (1024.0 * 1024 * 1024);
+                    if (freeGb < vhdxSizeGb)
+                    {
+                        Log(progress, "WARN", $"VeraCrypt volume has {freeGb:F1} GB free but VHDX needs {vhdxSizeGb} GB");
+                        vhdxSizeGb = Math.Max(10, (long)Math.Floor(freeGb * 0.9));
+                        Log(progress, "INFO", $"Reducing VHDX size to {vhdxSizeGb} GB to fit available space");
+                    }
+                }
+                catch { /* drive info unavailable — proceed with calculated size */ }
+
+                Log(progress, "INFO", $"Creating {vhdxSizeGb} GB VHDX at {vhdxPath}...");
+                ulong sizeBytes = (ulong)vhdxSizeGb * 1024 * 1024 * 1024;
+                await Task.Run(() => VhdxManager.CreateVhdx(vhdxPath, sizeBytes, progress: progress), ct);
+            }
+            else
+            {
+                Log(progress, "INFO", "Existing VHDX container found.");
+            }
+            ct.ThrowIfCancellationRequested();
+
+            bool vhdxMounted = false;
+            var vhdxDriveLetter = "B"; // temp letter for the VHDX locally on the backup server
+            var tempBackupDir = Path.Combine(@"E:\adshield_temp", computerName);
+
+            try
+            {
+                // ── Step 5: Mount VHDX locally on the backup server ─────────────────
+                Log(progress, "INFO", $"Mounting VHDX locally at {vhdxPath}...");
+                var mountScript = $"select vdisk file=\"{vhdxPath}\"\r\nattach vdisk";
+                await RunLocalDiskpart(mountScript, progress, ct);
+                vhdxMounted = true;
+                Log(progress, "SUCCESS", "VHDX mounted locally.");
+                ct.ThrowIfCancellationRequested();
+
+                // ── Step 6: Initialize VHDX locally (partition, format, assign letter) ──
+                string initScript;
+
+                if (isNewVhdx)
+                {
+                    Log(progress, "INFO", $"Initializing fresh local VHDX — partitioning, formatting, and assigning drive {vhdxDriveLetter}:...");
+                    initScript =
+                        $"select vdisk file=\"{vhdxPath}\"\r\n" +
+                        $"clean\r\n" +
+                        $"convert gpt\r\n" +
+                        $"create partition primary\r\n" +
+                        $"format fs=ntfs label=\"ADShield\" quick\r\n" +
+                        $"assign letter={vhdxDriveLetter} NOERR\r\n";
+                }
+                else
+                {
+                    Log(progress, "INFO", $"Mounting existing local VHDX — assigning drive {vhdxDriveLetter}:...");
+                    initScript =
+                        $"select vdisk file=\"{vhdxPath}\"\r\n" +
+                        $"online disk NOERR\r\n" +
+                        $"select partition 2\r\n" +
+                        $"assign letter={vhdxDriveLetter} NOERR\r\n";
+                }
+
+                await RunLocalDiskpart(initScript, progress, ct);
+
+                // Self-heal: Verify if drive B: exists and is fully formatted/writable.
+                bool isWritable = false;
                 try
                 {
                     if (Directory.Exists($"{vhdxDriveLetter}:\\"))
@@ -269,758 +223,410 @@ public class BackupOrchestrator
                 {
                     isWritable = false;
                 }
-            }
 
-            if (!isWritable)
-                throw new Exception($"Failed to mount, format and write to local drive {vhdxDriveLetter}:\\");
-
-            Log(progress, "SUCCESS", $"Local VHDX initialized as {vhdxDriveLetter}:");
-            ct.ThrowIfCancellationRequested();
-
-            // Grant explicit NTFS permissions on the mounted local VHDX drive root B:\ to remote computer account
-            try
-            {
-                var domain = Environment.UserDomainName;
-                var commands = new System.Collections.Generic.List<string>
+                if (!isWritable)
                 {
-                    $"\"{vhdxDriveLetter}:\\.\" /grant Everyone:(OI)(CI)F /T",
-                    $"\"{vhdxDriveLetter}:\\.\" /grant *S-1-5-11:(OI)(CI)F /T" // Authenticated Users
-                };
-
-                if (!string.IsNullOrEmpty(domain))
-                {
-                    commands.Add($"\"{vhdxDriveLetter}:\\.\" /grant \"{domain}\\Domain Computers\":(OI)(CI)F /T");
-                    commands.Add($"\"{vhdxDriveLetter}:\\.\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
-                }
-
-                await Task.Run(() =>
-                {
-                    foreach (var args in commands)
+                    Log(progress, "WARN", $"Drive {vhdxDriveLetter}:\\ is not writable or unformatted. Re-initializing partition and formatting NTFS...");
+                    var recoveryScript =
+                        $"select vdisk file=\"{vhdxPath}\"\r\n" +
+                        $"clean\r\n" +
+                        $"convert gpt\r\n" +
+                        $"create partition primary\r\n" +
+                        $"format fs=ntfs label=\"ADShield\" quick\r\n" +
+                        $"assign letter={vhdxDriveLetter} NOERR\r\n";
+                    await RunLocalDiskpart(recoveryScript, progress, ct);
+                    
+                    // Verify again after recovery
+                    try
                     {
-                        var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                        if (Directory.Exists($"{vhdxDriveLetter}:\\"))
                         {
-                            CreateNoWindow = true,
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true
-                        };
-                        using var proc = System.Diagnostics.Process.Start(psi);
-                        if (proc != null)
-                        {
-                            string stdout = proc.StandardOutput.ReadToEnd();
-                            string stderr = proc.StandardError.ReadToEnd();
-                            proc.WaitForExit();
-                            if (proc.ExitCode != 0)
-                            {
-                                Log(progress, "WARN", $"icacls failed (code {proc.ExitCode}) for: {args}. Error: {stderr.Trim()} {stdout.Trim()}");
-                            }
-                            else
-                            {
-                                Log(progress, "INFO", $"icacls permission applied successfully: {args}");
-                            }
+                            var testFile = Path.Combine($"{vhdxDriveLetter}:\\", "adshield_write_test.txt");
+                            File.WriteAllText(testFile, "test");
+                            File.Delete(testFile);
+                            isWritable = true;
                         }
                     }
-                }, ct);
+                    catch
+                    {
+                        isWritable = false;
+                    }
+                }
+
+                if (!isWritable)
+                    throw new Exception($"Failed to mount, format and write to local drive {vhdxDriveLetter}:\\");
+
+                Log(progress, "SUCCESS", $"Local VHDX initialized as {vhdxDriveLetter}:");
+                ct.ThrowIfCancellationRequested();
+
+                // Grant explicit NTFS permissions on the mounted local VHDX drive root B:\ to remote computer account
+                try
+                {
+                    var domain = Environment.UserDomainName;
+                    var commands = new System.Collections.Generic.List<string>
+                    {
+                        $"\"{vhdxDriveLetter}:\\.\" /grant Everyone:(OI)(CI)F /T",
+                        $"\"{vhdxDriveLetter}:\\.\" /grant *S-1-5-11:(OI)(CI)F /T" // Authenticated Users
+                    };
+
+                    if (!string.IsNullOrEmpty(domain))
+                    {
+                        commands.Add($"\"{vhdxDriveLetter}:\\.\" /grant \"{domain}\\Domain Computers\":(OI)(CI)F /T");
+                        commands.Add($"\"{vhdxDriveLetter}:\\.\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
+                    }
+
+                    await Task.Run(() =>
+                    {
+                        foreach (var args in commands)
+                        {
+                            var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                            {
+                                CreateNoWindow = true,
+                                UseShellExecute = false,
+                                RedirectStandardOutput = true,
+                                RedirectStandardError = true
+                            };
+                            using var proc = System.Diagnostics.Process.Start(psi);
+                            if (proc != null)
+                            {
+                                string stdout = proc.StandardOutput.ReadToEnd();
+                                string stderr = proc.StandardError.ReadToEnd();
+                                proc.WaitForExit();
+                                if (proc.ExitCode != 0)
+                                {
+                                    Log(progress, "WARN", $"icacls failed (code {proc.ExitCode}) for: {args}. Error: {stderr.Trim()} {stdout.Trim()}");
+                                }
+                                else
+                                {
+                                    Log(progress, "INFO", $"icacls permission applied successfully: {args}");
+                                }
+                            }
+                        }
+                    }, ct);
+                }
+                catch (Exception ex)
+                {
+                    Log(progress, "WARN", $"Could not set NTFS permissions on VHDX root drive {vhdxDriveLetter}:\\ : {ex.Message}");
+                }
+
+                // ── Step 5b: Configure local temporary share adshield_temp$ ─────────────────
+                var tempSharePath = @"E:\adshield_temp";
+                
+                Directory.CreateDirectory(tempSharePath);
+                Directory.CreateDirectory(tempBackupDir);
+                
+                // Set NTFS permission on E:\adshield_temp using icacls
+                try
+                {
+                    var domain = Environment.UserDomainName;
+                    var args = $"\"{tempSharePath}\" /grant \"{domain}\\Domain Computers\":(OI)(CI)M /T";
+                    var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    using var proc = System.Diagnostics.Process.Start(psi);
+                    proc?.WaitForExit();
+                }
+                catch (Exception ex)
+                {
+                    Log(progress, "WARN", $"Could not set NTFS permissions on staging folder: {ex.Message}");
+                }
+
+                Log(progress, "INFO", "Configuring temporary SMB share adshield_temp$...");
+                SmbShareManager.CreateStagingShare(tempSharePath, progress);
+                ct.ThrowIfCancellationRequested();
+
+                // ── Step 6: Trigger remote backup via agent ─────────────────────────────────
+                Log(progress, "INFO", $"Triggering client backup via ADShield agent...");
+                var backupTarget = $"\\\\FILESVR\\adshield_temp$\\{computerName}";
+                
+                await Task.Run(() => TriggerAgentBackup(computerName, backupTarget, progress), ct);
+                Log(progress, "SUCCESS", "Agent backup initialized.");
+                ct.ThrowIfCancellationRequested();
+
+                // ── Step 6b: Monitor backup progress ────────────────────────────────────────
+                Log(progress, "INFO", "Monitoring remote backup progress...");
+                int lastLength = 0;
+                var pollInterval = 15;
+                
+                while (true)
+                {
+                    await Task.Delay(pollInterval * 1000, ct);
+
+                    // Fetch latest status
+                    AgentStatusResponse? status = null;
+                    try
+                    {
+                        status = await Task.Run(() => GetAgentStatus(computerName, progress), ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log(progress, "WARN", $"Could not query agent status: {ex.Message}");
+                        continue;
+                    }
+
+                    if (status == null) continue;
+
+                    // Output new log entries
+                    string newLogs = status.ProgressMessage;
+                    if (newLogs.Length > lastLength)
+                    {
+                        var delta = newLogs.Substring(lastLength);
+                        lastLength = newLogs.Length;
+                        var lines = delta.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+                        foreach (var line in lines)
+                        {
+                            Log(progress, "INFO", $"[Agent] {line}");
+                        }
+                    }
+
+                    if (status.Status == "Success")
+                    {
+                        break;
+                    }
+                    else if (status.Status == "Failed")
+                    {
+                        throw new Exception($"Backup failed on client agent. Exit Code: {status.ExitCode}");
+                    }
+                    else if (status.Status == "Idle")
+                    {
+                        throw new Exception("Backup unexpectedly went idle on client agent.");
+                    }
+                }
+
+                Log(progress, "SUCCESS", "Remote wbadmin system image backup completed successfully.");
+                ct.ThrowIfCancellationRequested();
+
+                // ── Step 7: Local copy from staging directory into the mounted VHDX ──────
+                var srcPath = Path.Combine(tempBackupDir, "WindowsImageBackup");
+                var destPath = $"{vhdxDriveLetter}:\\WindowsImageBackup";
+
+                Log(progress, "INFO", $"Copying data into the encrypted VHDX: {srcPath} → {destPath}");
+                Log(progress, "INFO", "This may take a while depending on data size. Please wait...");
+                await RunLocalDataCopy(srcPath, destPath, computerName, progress, ct);
+                Log(progress, "SUCCESS", "Staged backup successfully copied and encrypted inside the virtual disk.");
+                ct.ThrowIfCancellationRequested();
+
+                // Persist result
+                AppConfig.UpdateBackupResult(computerName, "Success");
+                Log(progress, "SUCCESS", $"Backup sequence for {computerName} completed successfully!");
             }
             catch (Exception ex)
             {
-                Log(progress, "WARN", $"Could not set NTFS permissions on VHDX root drive {vhdxDriveLetter}:\\ : {ex.Message}");
-            }
+                AppConfig.UpdateBackupResult(computerName, $"Failed: {ex.Message}");
+                
+                // Try to cancel running backup on agent if cancelled or errored
+                try
+                {
+                    Log(progress, "WARN", "Attempting to cancel active remote backup session...");
+                    CancelAgentBackup(computerName);
+                }
+                catch { }
 
-            // ── Step 5b: Configure local temporary share adshield_temp$ ─────────────────
-            var tempSharePath = @"E:\adshield_temp";
-            
-            Directory.CreateDirectory(tempSharePath);
-            Directory.CreateDirectory(tempBackupDir);
-            
-            // Set NTFS permission on E:\adshield_temp using icacls
+                throw;
+            }
+            finally
+            {
+                // ── Cleanup — detach VHDX locally ───────────────────────────
+                if (vhdxMounted)
+                {
+                    Log(progress, "INFO", "Unmounting VHDX locally...");
+                    var detachScript = $"select vdisk file=\"{vhdxPath}\"\r\ndetach vdisk";
+                    try { await RunLocalDiskpart(detachScript, progress, ct); }
+                    catch (Exception ex) { progress.Report($"[WARN] Could not unmount local VHDX: {ex.Message}"); }
+                    Log(progress, "SUCCESS", "Local VHDX unmounted.");
+                }
+
+                // ── Clean up local staging folder ───────────────────────────
+                if (Directory.Exists(tempBackupDir))
+                {
+                    Log(progress, "INFO", "Cleaning up temporary staging folder...");
+                    try { Directory.Delete(tempBackupDir, true); }
+                    catch (Exception ex) { progress.Report($"[WARN] Could not delete staging folder: {ex.Message}"); }
+                }
+            }
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────────────────
+
+        private static void Log(IProgress<string> p, string level, string msg) =>
+            p.Report($"[{level}] {msg}");
+
+        internal static async Task RunLocalDiskpart(
+            string diskpartScript,
+            IProgress<string> progress,
+            CancellationToken ct)
+        {
+            var tempScript = Path.Combine(Path.GetTempPath(), $"adshield_{Guid.NewGuid():N}.txt");
+            File.WriteAllText(tempScript, diskpartScript);
+
+            var logFile = Path.Combine(Path.GetTempPath(), $"adshield_diskpart_{Guid.NewGuid():N}.log");
+
             try
             {
-                var domain = Environment.UserDomainName;
-                var args = $"\"{tempSharePath}\" /grant \"{domain}\\Domain Computers\":(OI)(CI)M /T";
-                var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c diskpart /s \"{tempScript}\" > \"{logFile}\" 2>&1")
                 {
                     CreateNoWindow = true,
                     UseShellExecute = false
                 };
                 using var proc = System.Diagnostics.Process.Start(psi);
-                proc?.WaitForExit();
+                if (proc != null)
+                {
+                    await proc.WaitForExitAsync(ct);
+                }
+
+                if (File.Exists(logFile))
+                {
+                    progress?.Report("[INFO] --- Local Diskpart Output ---");
+                    var lines = File.ReadAllLines(logFile);
+                    foreach (var line in lines)
+                    {
+                        if (!string.IsNullOrWhiteSpace(line))
+                            progress?.Report($"[INFO]   {line.Trim()}");
+                    }
+                    progress?.Report("[INFO] -----------------------------");
+                }
             }
             catch (Exception ex)
             {
-                Log(progress, "WARN", $"Could not set NTFS permissions on staging folder: {ex.Message}");
+                progress?.Report($"[WARN] Local diskpart failed: {ex.Message}");
             }
-
-            Log(progress, "INFO", "Configuring temporary SMB share adshield_temp$...");
-            SmbShareManager.CreateStagingShare(tempSharePath, progress);
-            ct.ThrowIfCancellationRequested();
-
-            // ── Step 6: Create and execute the Scheduled Task on the remote client ──────
-            Log(progress, "INFO", $"Registering Scheduled Task on remote client {computerName}...");
-            
-            // Script block that registers and runs the scheduled task
-            var script = 
-                "$ErrorActionPreference = 'Stop'\n" +
-                "$action = New-ScheduledTaskAction -Execute 'wbadmin.exe' -Argument 'start backup -backuptarget:\\\\FILESVR\\adshield_temp$\\" + computerName + " -include:c: -allcritical -quiet'\n" +
-                "$principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\\SYSTEM' -LogonType ServiceAccount\n" +
-                "$task = New-ScheduledTask -Action $action -Principal $principal\n" +
-                "Register-ScheduledTask -TaskName '" + taskName + "' -InputObject $task -Force | Out-Null\n" +
-                "Start-ScheduledTask -TaskName '" + taskName + "'\n";
-
-            // Base64 encode the script for encoded execution (prevents quote/character escaping issues)
-            var bytes = System.Text.Encoding.Unicode.GetBytes(script);
-            var base64 = Convert.ToBase64String(bytes);
-            var runCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {base64}";
-            
-            RunRemoteWmiCommand(computerName, runCmd, 30000);
-            taskRegistered = true;
-            Log(progress, "SUCCESS", "Scheduled Task registered and started on remote client.");
-            ct.ThrowIfCancellationRequested();
-
-            // Poll task state
-            Log(progress, "INFO", "Monitoring remote backup progress...");
-            var timeoutSeconds = 7200; // 2 hours
-            var elapsed = 0;
-            var pollInterval = 15;
-            
-            var localStateFile  = $@"\\{computerName}\C$\Windows\Temp\adshield_task_state.txt";
-            var localResultFile  = $@"\\{computerName}\C$\Windows\Temp\adshield_task_result.txt";
-
-            while (true)
+            finally
             {
-                await Task.Delay(pollInterval * 1000, ct);
-                elapsed += pollInterval;
-
-                // Query task state remotely and write to file
-                var checkCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"(Get-ScheduledTask -TaskName '{taskName}').State | Out-File '{remoteStateFile}' -Encoding ascii -Force\"";
-                try
-                {
-                    RunRemoteWmiCommand(computerName, checkCmd, 15000);
-                }
-                catch (Exception ex)
-                {
-                    Log(progress, "WARN", $"Could not query task status: {ex.Message}");
-                }
-
-                string state = "Unknown";
-                if (File.Exists(localStateFile))
-                {
-                    try
-                    {
-                        state = File.ReadAllText(localStateFile).Trim();
-                    }
-                    catch { }
-                }
-
-                Log(progress, "INFO", $"Remote Task State: {state} ({elapsed} seconds elapsed)...");
-
-                if (state != "Running" && state != "Unknown")
-                {
-                    break;
-                }
-
-                if (elapsed >= timeoutSeconds)
-                {
-                    Log(progress, "WARN", "Backup timeout reached. Terminating remote task...");
-                    var stopCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Stop-ScheduledTask -TaskName '{taskName}'\"";
-                    try { RunRemoteWmiCommand(computerName, stopCmd, 10000); } catch { }
-                    break;
-                }
-            }
-
-            // Get exit status
-            var resultCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"(Get-ScheduledTask -TaskName '{taskName}' | Get-ScheduledTaskInfo).LastTaskResult | Out-File '{remoteResultFile}' -Encoding ascii -Force\"";
-            try { RunRemoteWmiCommand(computerName, resultCmd, 15000); } catch { }
-
-            uint exitCode = 999;
-            if (File.Exists(localResultFile))
-            {
-                try
-                {
-                    if (uint.TryParse(File.ReadAllText(localResultFile).Trim(), out var parsed))
-                    {
-                        exitCode = parsed;
-                    }
-                }
-                catch { }
-            }
-
-            Log(progress, "INFO", $"Remote task finished with Exit Code (LastTaskResult): {exitCode}");
-
-            // Unregister task and clean up remote state files
-            try
-            {
-                var cleanCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Unregister-ScheduledTask -TaskName '{taskName}' -Confirm:\\$false; Remove-Item -Path '{remoteStateFile}', '{remoteResultFile}' -Force -ErrorAction SilentlyContinue\"";
-                RunRemoteWmiCommand(computerName, cleanCmd, 15000);
-                taskRegistered = false;
-            }
-            catch (Exception ex)
-            {
-                Log(progress, "WARN", $"Could not clean up scheduled task on remote client: {ex.Message}");
-            }
-
-            if (exitCode != 0)
-            {
-                throw new Exception($"wbadmin failed on remote client with exit code: {exitCode}");
-            }
-            Log(progress, "SUCCESS", "Remote wbadmin system image backup completed successfully.");
-            ct.ThrowIfCancellationRequested();
-
-            // ── Step 7: Local copy from staging directory into the mounted VHDX ──────
-            var srcPath = Path.Combine(tempBackupDir, "WindowsImageBackup");
-            var destPath = $"{vhdxDriveLetter}:\\WindowsImageBackup";
-
-            Log(progress, "INFO", $"Copying data into the encrypted VHDX: {srcPath} → {destPath}");
-            Log(progress, "INFO", "This may take a while depending on data size. Please wait...");
-            await RunLocalDataCopy(srcPath, destPath, computerName, progress, ct);
-            Log(progress, "SUCCESS", "Staged backup successfully copied and encrypted inside the virtual disk.");
-            ct.ThrowIfCancellationRequested();
-
-            // Persist result
-            AppConfig.UpdateBackupResult(computerName, "Success");
-            Log(progress, "SUCCESS", $"Backup sequence for {computerName} completed successfully!");
-        }
-        catch (Exception ex)
-        {
-            AppConfig.UpdateBackupResult(computerName, $"Failed: {ex.Message}");
-            throw;
-        }
-        finally
-        {
-            // ── Cleanup remote scheduled task ───────────────────────────────────
-            if (taskRegistered)
-            {
-                Log(progress, "INFO", "Cleaning up remote Scheduled Task...");
-                try
-                {
-                    var cleanCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Unregister-ScheduledTask -TaskName '{taskName}' -Confirm:\\$false; Remove-Item -Path '{remoteStateFile}', '{remoteResultFile}' -Force -ErrorAction SilentlyContinue\"";
-                    RunRemoteWmiCommand(computerName, cleanCmd, 15000);
-                }
-                catch (Exception ex) { progress.Report($"[WARN] Could not remove scheduled task: {ex.Message}"); }
-            }
-
-            // ── Cleanup — detach VHDX locally ───────────────────────────
-            if (vhdxMounted)
-            {
-                Log(progress, "INFO", "Unmounting VHDX locally...");
-                var detachScript = $"select vdisk file=\"{vhdxPath}\"\r\ndetach vdisk";
-                try { await RunLocalDiskpart(detachScript, progress, ct); }
-                catch (Exception ex) { progress.Report($"[WARN] Could not unmount local VHDX: {ex.Message}"); }
-                Log(progress, "SUCCESS", "Local VHDX unmounted.");
-            }
-
-            // ── Clean up local staging folder ───────────────────────────
-            if (Directory.Exists(tempBackupDir))
-            {
-                Log(progress, "INFO", "Cleaning up temporary staging folder...");
-                try { Directory.Delete(tempBackupDir, true); }
-                catch (Exception ex) { progress.Report($"[WARN] Could not delete staging folder: {ex.Message}"); }
+                try { File.Delete(tempScript); } catch {}
+                try { File.Delete(logFile); } catch {}
             }
         }
-    }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// <summary>Formats and reports a leveled log message via <paramref name="p"/>.</summary>
-    private static void Log(IProgress<string> p, string level, string msg) =>
-        p.Report($"[{level}] {msg}");
-
-    /// <summary>
-    /// Writes a diskpart script to a temp file and runs it locally via <c>cmd.exe /c diskpart /s</c>.
-    /// Captures and forwards all output to <paramref name="progress"/>.
-    /// </summary>
-    /// <param name="diskpartScript">The multi-line diskpart command text to execute.</param>
-    /// <param name="progress">Optional progress sink for diskpart output lines.</param>
-    /// <param name="ct">Cancellation token.</param>
-    internal static async Task RunLocalDiskpart(
-        string diskpartScript,
-        IProgress<string> progress,
-        CancellationToken ct)
-    {
-        var tempScript = Path.Combine(Path.GetTempPath(), $"adshield_{Guid.NewGuid():N}.txt");
-        File.WriteAllText(tempScript, diskpartScript);
-
-        var logFile = Path.Combine(Path.GetTempPath(), $"adshield_diskpart_{Guid.NewGuid():N}.log");
-
-        try
+        private async Task RunLocalDataCopy(
+            string uncSource,
+            string localDest,
+            string computerName,
+            IProgress<string> progress,
+            CancellationToken ct)
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c diskpart /s \"{tempScript}\" > \"{logFile}\" 2>&1")
-            {
-                CreateNoWindow = true,
-                UseShellExecute = false
-            };
-            using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc != null)
-            {
-                await proc.WaitForExitAsync(ct);
-            }
+            var logFile = Path.Combine(Path.GetTempPath(), $"adshield_robocopy_{computerName}.log");
 
-            if (File.Exists(logFile))
-            {
-                progress?.Report("[INFO] --- Local Diskpart Output ---");
-                var lines = File.ReadAllLines(logFile);
-                foreach (var line in lines)
-                {
-                    if (!string.IsNullOrWhiteSpace(line))
-                        progress?.Report($"[INFO]   {line.Trim()}");
-                }
-                progress?.Report("[INFO] -----------------------------");
-            }
-        }
-        catch (Exception ex)
-        {
-            progress?.Report($"[WARN] Local diskpart failed: {ex.Message}");
-        }
-        finally
-        {
-            try { File.Delete(tempScript); } catch {}
-            try { File.Delete(logFile); } catch {}
-        }
-    }
-
-    /// <summary>
-    /// Runs a diskpart script on a remote machine via WMI Win32_Process.Create().
-    /// This is a native WMI API call — not a local Process.Start.
-    /// </summary>
-    private static async Task RunRemoteDiskpart(
-        string computerName,
-        string diskpartScript,
-        IProgress<string> progress,
-        CancellationToken ct)
-    {
-        // Write the diskpart script directly to the remote machine's temp directory via C$ share
-        var tempFileName = $"adshield_{Guid.NewGuid():N}.txt";
-        var tempScript   = $@"C:\Windows\Temp\{tempFileName}";
-        var remotePath   = $@"\\{computerName}\C$\Windows\Temp\{tempFileName}";
-
-        File.WriteAllText(remotePath, diskpartScript);
-
-        // Use WMI Win32_Process to run diskpart remotely
-        var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
-        scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
-        scope.Options.EnablePrivileges = true;
-        scope.Connect();
-
-        using var processClass = new System.Management.ManagementClass(scope,
-            new System.Management.ManagementPath("Win32_Process"), null);
-
-        // Run diskpart with the script file and redirect output to a log file
-        var logFile = $"C:\\Windows\\Temp\\adshield_diskpart_{Guid.NewGuid():N}.log";
-        using var inDp = processClass.GetMethodParameters("Create");
-        inDp["CommandLine"] = $"cmd.exe /c diskpart /s \"{tempScript}\" > \"{logFile}\" 2>&1";
-        using var outDp = processClass.InvokeMethod("Create", inDp, null);
-        var pid = Convert.ToUInt32(outDp["ProcessId"]);
-        progress?.Report($"[INFO] Remote diskpart running (PID {pid})...");
-
-        // Wait for diskpart to finish (poll via WMI)
-        await WaitForRemoteProcess(scope, pid, 60_000, ct);
-
-        // Read and log diskpart results
-        try
-        {
-            var logPath = $@"\\{computerName}\C$\" + logFile.Substring(3);
-            if (File.Exists(logPath))
-            {
-                progress?.Report("[INFO] --- Remote Diskpart Output ---");
-                var lines = File.ReadAllLines(logPath);
-                foreach (var line in lines)
-                {
-                    if (!string.IsNullOrWhiteSpace(line))
-                        progress?.Report($"[INFO]   {line.Trim()}");
-                }
-                progress?.Report("[INFO] ------------------------------");
-            }
-        }
-        catch (Exception ex)
-        {
-            progress?.Report($"[WARN] Could not read diskpart output log: {ex.Message}");
-        }
-
-        // Cleanup temp file and log file
-        using var inClean = processClass.GetMethodParameters("Create");
-        inClean["CommandLine"] = $"cmd.exe /c del /f /q \"{tempScript}\" \"{logFile}\"";
-        processClass.InvokeMethod("Create", inClean, null);
-    }
-
-    private static async Task WaitForRemoteProcess(
-        System.Management.ManagementScope scope,
-        uint pid, int timeoutMs, CancellationToken ct)
-    {
-        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        while (DateTime.UtcNow < deadline)
-        {
-            ct.ThrowIfCancellationRequested();
-            var q = new System.Management.ObjectQuery(
-                $"SELECT * FROM Win32_Process WHERE ProcessId = {pid}");
-            using var s = new System.Management.ManagementObjectSearcher(scope, q);
-            if (s.Get().Count == 0) return;
-            await Task.Delay(1000, ct);
-        }
-        throw new TimeoutException($"Remote process {pid} did not complete within timeout.");
-    }
-
-    private static string GetLocalIpAddress()
-    {
-        var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
-        return host.AddressList
-            .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
-                               && !System.Net.IPAddress.IsLoopback(a))
-            ?.ToString()
-            ?? "127.0.0.1";
-    }
-
-    /// <summary>
-    /// Queries a remote machine's disk usage via WMI Win32_LogicalDisk.
-    /// Returns (usedGB, totalGB) for the specified drive letter.
-    /// </summary>
-    private static (double usedGb, double totalGb) GetRemoteDiskUsage(string computerName, string driveLetter)
-    {
-        var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
-        scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
-        scope.Options.EnablePrivileges = true;
-        scope.Connect();
-
-        var query = new System.Management.ObjectQuery(
-            $"SELECT Size, FreeSpace FROM Win32_LogicalDisk WHERE DeviceID = '{driveLetter}'");
-        using var searcher = new System.Management.ManagementObjectSearcher(scope, query);
-        foreach (var obj in searcher.Get())
-        {
-            var totalBytes = Convert.ToDouble(obj["Size"]);
-            var freeBytes  = Convert.ToDouble(obj["FreeSpace"]);
-            var usedBytes  = totalBytes - freeBytes;
-            return (usedBytes / (1024.0 * 1024 * 1024), totalBytes / (1024.0 * 1024 * 1024));
-        }
-        throw new Exception($"Drive {driveLetter} not found on {computerName}");
-    }
-
-    /// <summary>
-    /// Looks up the VSS shadow copy's DeviceObject path via WMI.
-    /// Returns something like: \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy3\
-    /// </summary>
-    private static string GetShadowDevicePath(string computerName, string shadowId)
-    {
-        var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
-        scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
-        scope.Options.EnablePrivileges = true;
-        scope.Connect();
-
-        var query = new System.Management.ObjectQuery(
-            $"SELECT DeviceObject FROM Win32_ShadowCopy WHERE ID = '{shadowId}'");
-        using var searcher = new System.Management.ManagementObjectSearcher(scope, query);
-        foreach (var obj in searcher.Get())
-        {
-            var devicePath = obj["DeviceObject"]?.ToString();
-            if (!string.IsNullOrEmpty(devicePath))
-                return devicePath.TrimEnd('\\') + "\\";
-        }
-        throw new Exception($"Shadow copy {shadowId} not found on {computerName}");
-    }
-
-    /// <summary>
-    /// Enables Remote-to-Local (R2L) symlink evaluation on the LOCAL backup server.
-    /// The server needs this because it traverses a symlink on the remote client's admin share
-    /// (\\CLIENT\C$\adshield_vss_link) that points to a local device path on the client.
-    /// Idempotent — safe to call multiple times. Only writes if not already enabled.
-    /// </summary>
-    private static void EnableLocalSymlinkEvaluation(IProgress<string> progress)
-    {
-        try
-        {
-            // Check current value first
-            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
-                @"SYSTEM\CurrentControlSet\Control\FileSystem", writable: true);
-            if (key != null)
-            {
-                var current = key.GetValue("SymlinkRemoteToLocalEvaluation");
-                if (current is int val && val == 1)
-                {
-                    progress.Report("[INFO] R2L symlink evaluation already enabled on this server.");
-                    return;
-                }
-
-                key.SetValue("SymlinkRemoteToLocalEvaluation", 1, Microsoft.Win32.RegistryValueKind.DWord);
-                progress.Report("[SUCCESS] R2L symlink evaluation enabled on this server.");
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            progress.Report($"[WARN] Registry write failed: {ex.Message}. Trying fsutil...");
-        }
-
-        // Fallback: fsutil
-        try
-        {
-            var psi = new System.Diagnostics.ProcessStartInfo("fsutil", "behavior set symlinkevaluation R2L:1")
+            var psi = new System.Diagnostics.ProcessStartInfo("robocopy.exe")
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true
             };
+            foreach (var arg in new[]
+            {
+                uncSource, localDest,
+                "/E", "/COPY:DAT", "/R:1", "/W:1", "/NP", "/XJ",
+                "/XD", "System Volume Information", "$Recycle.Bin", "$WinREAgent", "Recovery",
+                $"/LOG:{logFile}"
+            })
+                psi.ArgumentList.Add(arg);
+
+            Log(progress, "INFO", $"Server-pull robocopy: robocopy {string.Join(" ", psi.ArgumentList)}");
+
             using var proc = System.Diagnostics.Process.Start(psi);
-            proc?.WaitForExit(10000);
-            progress.Report("[SUCCESS] R2L symlink evaluation enabled via fsutil on this server.");
-        }
-        catch (Exception ex2)
-        {
-            progress.Report($"[WARN] fsutil fallback also failed: {ex2.Message}. Run manually: fsutil behavior set symlinkevaluation R2L:1");
-        }
-    }
+            if (proc == null)
+                throw new Exception("Failed to start local robocopy process.");
 
-    /// <summary>
-    /// Enables Remote-to-Local (R2L) symlink evaluation on the target machine via WMI registry write.
-    /// This allows the server to traverse symlinks on the client's C$ admin share that point to
-    /// local VSS device paths. Idempotent — safe to call multiple times.
-    /// </summary>
-    private static void EnableRemoteSymlinkEvaluation(string computerName, IProgress<string> progress)
-    {
-        try
-        {
-            var scope = new System.Management.ManagementScope($@"\\{computerName}\root\default");
-            scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
-            scope.Options.EnablePrivileges = true;
-            scope.Connect();
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = proc.StandardError.ReadToEndAsync(ct);
 
-            using var regClass = new System.Management.ManagementClass(scope,
-                new System.Management.ManagementPath("StdRegProv"), null);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromHours(2));
 
-            // HKLM = 0x80000002
-            uint hklm = 0x80000002;
-            string subKey = @"SYSTEM\CurrentControlSet\Control\FileSystem";
-            string valueName = "SymlinkRemoteToLocalEvaluation";
-
-            using var inParams = regClass.GetMethodParameters("SetDWORDValue");
-            inParams["hDefKey"] = hklm;
-            inParams["sSubKeyName"] = subKey;
-            inParams["sValueName"] = valueName;
-            inParams["uValue"] = (uint)1;
-
-            using var outParams = regClass.InvokeMethod("SetDWORDValue", inParams, null);
-            var retVal = Convert.ToUInt32(outParams["ReturnValue"]);
-            if (retVal != 0)
-                throw new Exception($"Registry write returned {retVal}");
-
-            progress.Report("[SUCCESS] R2L symlink evaluation enabled on remote client.");
-        }
-        catch (Exception ex)
-        {
-            progress.Report($"[WARN] Could not enable R2L symlink evaluation via registry: {ex.Message}");
-            progress.Report("[INFO] Falling back to fsutil via WMI process...");
-
-            // Fallback: run fsutil remotely via WMI Win32_Process
             try
             {
-                RunRemoteWmiCommand(computerName,
-                    "cmd.exe /c fsutil behavior set symlinkevaluation R2L:1", 10000);
-                progress.Report("[SUCCESS] R2L symlink evaluation enabled via fsutil.");
+                await proc.WaitForExitAsync(timeoutCts.Token);
             }
-            catch (Exception ex2)
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                progress.Report($"[WARN] fsutil fallback also failed: {ex2.Message}. Backup may fail if R2L is not already enabled.");
+                try { proc.Kill(entireProcessTree: true); } catch { }
+                throw new TimeoutException("Local robocopy did not complete within the 2 hour timeout.");
             }
-        }
-    }
 
-    /// <summary>
-    /// Creates a directory symlink on the remote client pointing to the VSS shadow device path.
-    /// Uses WMI Win32_Process to run mklink on the target machine.
-    /// </summary>
-    private static async Task CreateRemoteVssSymlink(
-        string computerName,
-        string linkPath,
-        string shadowDevicePath,
-        IProgress<string> progress,
-        CancellationToken ct)
-    {
-        // Clean up any stale symlink first
-        try
-        {
-            RunRemoteWmiCommand(computerName,
-                $"cmd.exe /c if exist {linkPath} rmdir {linkPath}", 10000);
-        }
-        catch { /* ignore */ }
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
 
-        var createCmd = $"cmd.exe /c mklink /d {linkPath} {shadowDevicePath}";
-        Log(progress, "INFO", $"Creating remote symlink: {createCmd}");
-        RunRemoteWmiCommand(computerName, createCmd, 15000);
-        Log(progress, "SUCCESS", "Remote VSS symbolic link created.");
-        await Task.CompletedTask; // maintain async signature for orchestration consistency
-    }
+            Log(progress, "INFO", $"Robocopy exited with code {proc.ExitCode}.");
 
-    /// <summary>
-    /// Removes the VSS symlink from the remote client.
-    /// </summary>
-    private static async Task RemoveRemoteVssSymlink(
-        string computerName,
-        string linkPath,
-        IProgress<string> progress,
-        CancellationToken ct)
-    {
-        RunRemoteWmiCommand(computerName, $"cmd.exe /c rmdir {linkPath}", 10000);
-        Log(progress, "INFO", "Remote VSS symbolic link removed.");
-        await Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// Creates a hidden SMB share on the remote client via WMI, pointing to the VSS symlink folder.
-    /// The SMB server on the client resolves the symlink locally when serving files, avoiding the
-    /// problem where remote SMB clients cannot traverse symlinks to VSS device paths through C$.
-    /// </summary>
-    private static void CreateRemoteHiddenShare(
-        string computerName,
-        string shareName,
-        string localPath,
-        IProgress<string> progress)
-    {
-        // Remove any stale share first
-        try { RemoveRemoteHiddenShare(computerName, shareName, progress); }
-        catch { /* ignore if share doesn't exist */ }
-
-        var cmd = $"cmd.exe /c net share {shareName}={localPath} /GRANT:Everyone,READ";
-        RunRemoteWmiCommand(computerName, cmd, 15000);
-        Log(progress, "SUCCESS", $"Hidden share \\\\{computerName}\\{shareName} created.");
-    }
-
-    /// <summary>
-    /// Removes the hidden backup share from the remote client.
-    /// </summary>
-    private static void RemoveRemoteHiddenShare(
-        string computerName,
-        string shareName,
-        IProgress<string> progress)
-    {
-        RunRemoteWmiCommand(computerName, $"cmd.exe /c net share {shareName} /DELETE /Y", 10000);
-        Log(progress, "INFO", $"Hidden share {shareName} removed from {computerName}.");
-    }
-
-    /// <summary>
-    /// Runs robocopy locally on the backup server, pulling data from the client's hidden backup share
-    /// (which exposes the VSS symlink folder) to the locally mounted VHDX drive.
-    /// The SMB server on the client resolves the symlink locally, so no R2L traversal is needed.
-    /// This eliminates the Kerberos double-hop problem — single network hop only.
-    /// </summary>
-    private async Task RunLocalDataCopy(
-        string uncSource,
-        string localDest,
-        string computerName,
-        IProgress<string> progress,
-        CancellationToken ct)
-    {
-        var logFile = Path.Combine(Path.GetTempPath(), $"adshield_robocopy_{computerName}.log");
-
-        // ArgumentList handles quoting automatically — prevents path\backslash breakage
-        // (same pattern as VeraCryptManager.cs; eliminates the class of \" escape bugs)
-        var psi = new System.Diagnostics.ProcessStartInfo("robocopy.exe")
-        {
-            CreateNoWindow = true,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        foreach (var arg in new[]
-        {
-            uncSource, localDest,
-            "/E", "/COPY:DAT", "/R:1", "/W:1", "/NP", "/XJ",
-            "/XD", "System Volume Information", "$Recycle.Bin", "$WinREAgent", "Recovery",
-            $"/LOG:{logFile}"
-        })
-            psi.ArgumentList.Add(arg);
-
-        Log(progress, "INFO", $"Server-pull robocopy: robocopy {string.Join(" ", psi.ArgumentList)}");
-
-        using var proc = System.Diagnostics.Process.Start(psi);
-        if (proc == null)
-            throw new Exception("Failed to start local robocopy process.");
-
-        // Don't block on stdout/stderr — robocopy can produce huge output
-        var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-
-        // Robocopy can take a LONG time — 2 hour timeout
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromHours(2));
-
-        try
-        {
-            await proc.WaitForExitAsync(timeoutCts.Token);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            try { proc.Kill(entireProcessTree: true); } catch { }
-            throw new TimeoutException("Local robocopy did not complete within the 2 hour timeout.");
-        }
-
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-
-        // Robocopy exit codes: 0-7 = success/warnings, 8+ = errors
-        Log(progress, "INFO", $"Robocopy exited with code {proc.ExitCode}.");
-
-        // Parse log file for detailed results
-        if (File.Exists(logFile))
-        {
-            var logLines = File.ReadAllLines(logFile);
-
-            // Show the summary (last 12 lines)
-            var summary = logLines.Skip(Math.Max(0, logLines.Length - 12)).ToList();
-            foreach (var line in summary.Where(l => !string.IsNullOrWhiteSpace(l)))
-                Log(progress, "INFO", $"  {line.Trim()}");
-
-            // Scan for critical errors
-            foreach (var line in logLines)
+            if (File.Exists(logFile))
             {
-                if (line.Contains("ERROR ") && !line.Contains("ERROR 0 (0x00000000)"))
+                var logLines = File.ReadAllLines(logFile);
+
+                var summary = logLines.Skip(Math.Max(0, logLines.Length - 12)).ToList();
+                foreach (var line in summary.Where(l => !string.IsNullOrWhiteSpace(l)))
+                    Log(progress, "INFO", $"  {line.Trim()}");
+
+                foreach (var line in logLines)
                 {
-                    throw new Exception($"Robocopy failed: {line.Trim()}");
+                    if (line.Contains("ERROR ") && !line.Contains("ERROR 0 (0x00000000)"))
+                    {
+                        throw new Exception($"Robocopy failed: {line.Trim()}");
+                    }
                 }
             }
+
+            if (proc.ExitCode >= 8)
+            {
+                throw new Exception(
+                    $"Robocopy failed with exit code {proc.ExitCode}. " +
+                    $"Stdout: {stdout.Trim()} Stderr: {stderr.Trim()}");
+            }
         }
 
-        // Exit code 8+ means a real failure
-        if (proc.ExitCode >= 8)
+        private AgentStatusResponse? GetAgentStatus(string computerName, IProgress<string> progress)
         {
-            throw new Exception(
-                $"Robocopy failed with exit code {proc.ExitCode}. " +
-                $"Stdout: {stdout.Trim()} Stderr: {stderr.Trim()}");
+            using var client = new System.Net.Http.HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+            client.DefaultRequestHeaders.Add("X-ADShield-Key", _settings.AgentApiKey);
+
+            var url = $"http://{computerName}:{_settings.AgentPort}/status";
+            var response = client.GetAsync(url).Result;
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception($"HTTP Status: {response.StatusCode}");
+            }
+
+            var json = response.Content.ReadAsStringAsync().Result;
+            return Newtonsoft.Json.JsonConvert.DeserializeObject<AgentStatusResponse>(json);
         }
-    }
 
-    /// <summary>
-    /// Executes a command on a remote machine via WMI Win32_Process.Create and waits for completion.
-    /// Used for lightweight operations (symlink create/delete, fsutil) — NOT for long-running data copies.
-    /// </summary>
-    private static void RunRemoteWmiCommand(string computerName, string commandLine, int timeoutMs)
-    {
-        var scope = new System.Management.ManagementScope($@"\\{computerName}\root\cimv2");
-        scope.Options.Impersonation = System.Management.ImpersonationLevel.Impersonate;
-        scope.Options.EnablePrivileges = true;
-        scope.Connect();
-
-        using var processClass = new System.Management.ManagementClass(scope,
-            new System.Management.ManagementPath("Win32_Process"), null);
-
-        using var inParams = processClass.GetMethodParameters("Create");
-        inParams["CommandLine"] = commandLine;
-
-        using var outParams = processClass.InvokeMethod("Create", inParams, null);
-        var retVal = Convert.ToUInt32(outParams["ReturnValue"]);
-        if (retVal != 0)
-            throw new Exception($"WMI process creation failed for '{commandLine}'. Return: {retVal}");
-
-        var pid = Convert.ToUInt32(outParams["ProcessId"]);
-
-        // Poll for process completion
-        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        while (DateTime.UtcNow < deadline)
+        private void TriggerAgentBackup(string computerName, string backupTarget, IProgress<string> progress)
         {
-            Thread.Sleep(500);
-            var query = new System.Management.ObjectQuery(
-                $"SELECT ProcessId FROM Win32_Process WHERE ProcessId = {pid}");
-            using var searcher = new System.Management.ManagementObjectSearcher(scope, query);
-            if (searcher.Get().Count == 0)
-                return; // Process finished
+            using var client = new System.Net.Http.HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(15);
+            client.DefaultRequestHeaders.Add("X-ADShield-Key", _settings.AgentApiKey);
+
+            var url = $"http://{computerName}:{_settings.AgentPort}/backup";
+            var payload = new BackupRequestPayload { BackupTarget = backupTarget };
+            var json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
+            using var content = new System.Net.Http.StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = client.PostAsync(url, content).Result;
+            if (response.StatusCode == HttpStatusCode.Conflict)
+            {
+                throw new Exception("Agent is already running a backup session.");
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception($"HTTP Status: {response.StatusCode}");
+            }
         }
-        throw new TimeoutException($"Remote command did not complete within {timeoutMs / 1000}s.");
+
+        private void CancelAgentBackup(string computerName)
+        {
+            try
+            {
+                using var client = new System.Net.Http.HttpClient();
+                client.Timeout = TimeSpan.FromSeconds(5);
+                client.DefaultRequestHeaders.Add("X-ADShield-Key", _settings.AgentApiKey);
+
+                var url = $"http://{computerName}:{_settings.AgentPort}/cancel";
+                var response = client.PostAsync(url, null).Result;
+            }
+            catch { }
+        }
     }
 }

@@ -121,14 +121,27 @@ public static class VssManager
         error = string.Empty;
         try
         {
-            var scope = new ManagementScope($@"\\{computerName}\root\cimv2");
-            scope.Options.Timeout = TimeSpan.FromSeconds(10);
-            scope.Connect();
-            return scope.IsConnected;
+            var settings = AppConfig.ReadSettings();
+            using var client = new System.Net.Http.HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(5);
+            client.DefaultRequestHeaders.Add("X-ADShield-Key", settings.AgentApiKey);
+
+            var url = $"http://{computerName}:{settings.AgentPort}/status";
+            var response = client.GetAsync(url).Result;
+            if (response.IsSuccessStatusCode)
+            {
+                return true;
+            }
+            error = $"HTTP status code: {response.StatusCode}";
+            return false;
         }
         catch (Exception ex)
         {
             error = ex.Message;
+            if (ex.InnerException != null)
+            {
+                error += $" ({ex.InnerException.Message})";
+            }
             return false;
         }
     }
