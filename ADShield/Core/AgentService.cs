@@ -244,6 +244,24 @@ namespace ADShield.Core
                         return;
                     }
 
+                    // Strict Input Sanitization & Validation (Defense-in-depth)
+                    var target = payload.BackupTarget.Trim();
+                    if (target.Contains("\"") || target.Contains("'") || target.Contains("\n") || target.Contains("\r"))
+                    {
+                        SendResponse(resp, HttpStatusCode.BadRequest, "Bad Request: backupTarget must not contain quotes or control characters.");
+                        return;
+                    }
+                    if (!target.StartsWith(@"\\"))
+                    {
+                        SendResponse(resp, HttpStatusCode.BadRequest, "Bad Request: backupTarget must be a UNC share path starting with '\\\\'.");
+                        return;
+                    }
+                    if (target.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+                    {
+                        SendResponse(resp, HttpStatusCode.BadRequest, "Bad Request: backupTarget contains invalid path characters.");
+                        return;
+                    }
+
                     bool started = false;
                     lock (_stateLock)
                     {
