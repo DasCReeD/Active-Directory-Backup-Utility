@@ -190,10 +190,18 @@ public partial class MainForm
         var name = _gridDash.Rows[e.RowIndex].Cells[0].Value?.ToString();
         if (string.IsNullOrEmpty(name)) return;
         var computer = _computers.FirstOrDefault(c => c.ComputerName == name);
-        if (computer is { IsOnline: false })
+        if (computer == null) return;
+        if (computer.LastBackupStatus == "In Progress")
         {
-            MessageBox.Show($"{name} appears offline. Backup may fail.\n\nContinue anyway?",
+            MessageBox.Show($"A backup session is already in progress for {name}.",
+                "Backup Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (computer.IsOnline == false)
+        {
+            var res = MessageBox.Show($"{name} appears offline. Backup may fail.\n\nContinue anyway?",
                 "Host Offline", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+            if (res != DialogResult.OK && res != DialogResult.Yes) return;
         }
         _ = TriggerBackup(name!);
     }
@@ -388,11 +396,17 @@ public partial class MainForm
         _gridDash.Rows.Clear();
         foreach (var c in _computers)
         {
+            string btnText = c.LastBackupStatus == "In Progress" ? "Running" : "Backup";
             int i = _gridDash.Rows.Add(c.ComputerName, string.IsNullOrEmpty(c.IPAddress) ? "—" : c.IPAddress, c.OperatingSystem,
-                c.OnlineDisplay, c.LastBackupStatus, c.LastBackupTimeDisplay, "Backup");
+                c.OnlineDisplay, c.LastBackupStatus, c.LastBackupTimeDisplay, btnText);
             // column 3 = Status, column 4 = Last Backup
             _gridDash.Rows[i].Cells[3].Style.ForeColor = Theme.OnlineColor(c.IsOnline);
             _gridDash.Rows[i].Cells[4].Style.ForeColor = Theme.StatusColor(c.LastBackupStatus);
+            if (c.LastBackupStatus == "In Progress")
+            {
+                var cell = (DataGridViewButtonCell)_gridDash.Rows[i].Cells[6];
+                cell.ReadOnly = true;
+            }
         }
     }
 
