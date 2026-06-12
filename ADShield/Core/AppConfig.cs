@@ -61,6 +61,10 @@ public static class AppConfig
             {
                 d.LastBackupStatus = prev.LastBackupStatus;
                 d.LastBackupTime   = prev.LastBackupTime;
+                if (string.IsNullOrEmpty(d.IPAddress) && !string.IsNullOrEmpty(prev.IPAddress))
+                {
+                    d.IPAddress = prev.IPAddress;
+                }
             }
             return d;
         }).ToList();

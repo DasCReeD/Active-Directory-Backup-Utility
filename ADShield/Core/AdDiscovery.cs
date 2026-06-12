@@ -81,6 +81,7 @@ public static class AdDiscovery
 
             bool online = false;
             int  pingMs = 0;
+            string ipAddress = string.Empty;
 
             if (pingCheck)
             {
@@ -92,6 +93,7 @@ public static class AdDiscovery
                     {
                         online = true;
                         pingMs = (int)reply.RoundtripTime;
+                        ipAddress = reply.Address?.ToString() ?? string.Empty;
                     }
                 }
                 catch { /* host unreachable — leave offline */ }
@@ -108,7 +110,8 @@ public static class AdDiscovery
                 IsOnline          = online,
                 PingMs            = pingMs,
                 LastBackupStatus  = prev?.LastBackupStatus ?? "Never Backed Up",
-                LastBackupTime    = prev?.LastBackupTime
+                LastBackupTime    = prev?.LastBackupTime,
+                IPAddress         = ipAddress
             });
 
             progress?.Report($"[INFO] Found: {name} ({os}) — {(online ? $"Online {pingMs}ms" : "Offline")}");

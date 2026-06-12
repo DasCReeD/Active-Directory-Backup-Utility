@@ -109,6 +109,7 @@ public partial class MainForm
             {
                 bool online = false;
                 int pingMs = 0;
+                string ipAddress = string.Empty;
                 try
                 {
                     using var ping = new System.Net.NetworkInformation.Ping();
@@ -117,11 +118,16 @@ public partial class MainForm
                     {
                         online = true;
                         pingMs = (int)reply.RoundtripTime;
+                        ipAddress = reply.Address?.ToString() ?? string.Empty;
                     }
                 }
                 catch { }
                 c.IsOnline = online;
                 c.PingMs = pingMs;
+                if (!string.IsNullOrEmpty(ipAddress))
+                {
+                    c.IPAddress = ipAddress;
+                }
             }).ToList();
 
             await Task.WhenAll(tasks);
@@ -180,7 +186,7 @@ public partial class MainForm
 
     private void GridDash_CellClick(object? sender, DataGridViewCellEventArgs e)
     {
-        if (e.RowIndex < 0 || e.ColumnIndex != 5) return; // column 5 = Action button
+        if (e.RowIndex < 0 || e.ColumnIndex != 6) return; // column 6 = Action button
         var name = _gridDash.Rows[e.RowIndex].Cells[0].Value?.ToString();
         if (string.IsNullOrEmpty(name)) return;
         var computer = _computers.FirstOrDefault(c => c.ComputerName == name);
@@ -382,11 +388,11 @@ public partial class MainForm
         _gridDash.Rows.Clear();
         foreach (var c in _computers)
         {
-            int i = _gridDash.Rows.Add(c.ComputerName, c.OperatingSystem,
+            int i = _gridDash.Rows.Add(c.ComputerName, string.IsNullOrEmpty(c.IPAddress) ? "—" : c.IPAddress, c.OperatingSystem,
                 c.OnlineDisplay, c.LastBackupStatus, c.LastBackupTimeDisplay, "Backup");
-            // column 2 = Status, column 3 = Last Backup
-            _gridDash.Rows[i].Cells[2].Style.ForeColor = Theme.OnlineColor(c.IsOnline);
-            _gridDash.Rows[i].Cells[3].Style.ForeColor = Theme.StatusColor(c.LastBackupStatus);
+            // column 3 = Status, column 4 = Last Backup
+            _gridDash.Rows[i].Cells[3].Style.ForeColor = Theme.OnlineColor(c.IsOnline);
+            _gridDash.Rows[i].Cells[4].Style.ForeColor = Theme.StatusColor(c.LastBackupStatus);
         }
     }
 
@@ -399,9 +405,9 @@ public partial class MainForm
             c.ComputerName.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
             c.OperatingSystem.Contains(filter, StringComparison.OrdinalIgnoreCase)))
         {
-            int i = _gridComp.Rows.Add(c.ComputerName, c.DnsHostName, c.OU, c.OperatingSystem,
+            int i = _gridComp.Rows.Add(c.ComputerName, c.DnsHostName, string.IsNullOrEmpty(c.IPAddress) ? "—" : c.IPAddress, c.OU, c.OperatingSystem,
                 c.IsOnline ? c.PingMs.ToString() : "—", c.OnlineDisplay);
-            _gridComp.Rows[i].Cells[5].Style.ForeColor = Theme.OnlineColor(c.IsOnline);
+            _gridComp.Rows[i].Cells[6].Style.ForeColor = Theme.OnlineColor(c.IsOnline);
         }
     }
 

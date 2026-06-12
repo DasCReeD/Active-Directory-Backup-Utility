@@ -212,9 +212,12 @@ public partial class MainForm : Form
         var (tblPanel, tblHdr) = MakeCard2("Domain Computers", "Agentless VSS targets");
         _gridDash = Theme.MakeGrid();
         _gridDash.Dock = DockStyle.Fill;
-        _gridDash.Columns.Add(Col("Computer", 18)); _gridDash.Columns.Add(Col("OS", 24));
-        _gridDash.Columns.Add(Col("Status", 14));   _gridDash.Columns.Add(Col("Last Backup", 16));
-        _gridDash.Columns.Add(Col("Time", 14));
+        _gridDash.Columns.Add(Col("Computer", 15));
+        _gridDash.Columns.Add(Col("IP Address", 14));
+        _gridDash.Columns.Add(Col("OS", 20));
+        _gridDash.Columns.Add(Col("Status", 14));
+        _gridDash.Columns.Add(Col("Last Backup", 16));
+        _gridDash.Columns.Add(Col("Time", 11));
         _gridDash.Columns.Add(new DataGridViewButtonColumn { HeaderText = "Action", FillWeight = 10, Text = "Backup", UseColumnTextForButtonValue = true });
         _gridDash.CellClick += GridDash_CellClick;
         tblPanel.Controls.Add(_gridDash);         // Fill first
@@ -249,9 +252,13 @@ public partial class MainForm : Form
         searchRow.Controls.Add(_tbSearch);
         _gridComp = Theme.MakeGrid();
         _gridComp.Dock = DockStyle.Fill;
-        _gridComp.Columns.Add(Col("Computer Name", 16));    _gridComp.Columns.Add(Col("DNS Hostname", 22));
-        _gridComp.Columns.Add(Col("Organizational Unit", 28)); _gridComp.Columns.Add(Col("Operating System", 18));
-        _gridComp.Columns.Add(Col("Ping ms", 8));            _gridComp.Columns.Add(Col("State", 10));
+        _gridComp.Columns.Add(Col("Computer Name", 14));
+        _gridComp.Columns.Add(Col("DNS Hostname", 20));
+        _gridComp.Columns.Add(Col("IP Address", 14));
+        _gridComp.Columns.Add(Col("Organizational Unit", 22));
+        _gridComp.Columns.Add(Col("Operating System", 16));
+        _gridComp.Columns.Add(Col("Ping ms", 6));
+        _gridComp.Columns.Add(Col("State", 8));
         card.Controls.Add(_gridComp);          // Fill first
         card.Controls.Add(searchRow);          // Top
         card.Controls.Add(Theme.MakeSeparator());

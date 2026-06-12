@@ -10,6 +10,7 @@ public class ComputerEntry
     public int    PingMs       { get; set; }
     public string LastBackupStatus { get; set; } = "Never Backed Up";
     public DateTime? LastBackupTime { get; set; }
+    public string IPAddress    { get; set; } = string.Empty;
 
     // Computed display helpers
     public string OnlineDisplay => IsOnline ? $"Online  ({PingMs} ms)" : "Offline";
