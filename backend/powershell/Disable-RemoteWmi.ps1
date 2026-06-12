@@ -12,12 +12,18 @@ Disable-NetFirewallRule -DisplayGroup "Windows Management Instrumentation (WMI)"
 Disable-NetFirewallRule -DisplayGroup "Remote Administration" -ErrorAction SilentlyContinue
 
 # 2. Revert any Network Profiles that were temporarily changed to Private back to Public
-$profiles = Get-NetConnectionProfile
-foreach ($p in $profiles) {
-    if ($p.NetworkCategory -eq "Private") {
-        Write-Host "Reverting Network Profile '$($p.Name)' from Private back to Public..." -ForegroundColor Yellow
-        Set-NetConnectionProfile -Name $p.Name -NetworkCategory Public
+$tempFile = "$env:TEMP\ADShield_ChangedProfiles.txt"
+if (Test-Path $tempFile) {
+    $changedProfiles = Get-Content -Path $tempFile
+    foreach ($name in $changedProfiles) {
+        if ($name) {
+            Write-Host "Reverting Network Profile '$name' from Private back to Public..." -ForegroundColor Yellow
+            Set-NetConnectionProfile -Name $name -NetworkCategory Public -ErrorAction SilentlyContinue
+        }
     }
+    Remove-Item -Path $tempFile -ErrorAction SilentlyContinue
+} else {
+    Write-Host "No record of modified network profiles found. Skipping profile revert." -ForegroundColor Gray
 }
 
 Write-Host "Security configuration restored successfully. Remote WMI is now blocked." -ForegroundColor Green

@@ -18,11 +18,22 @@ Enable-NetFirewallRule -DisplayGroup "Remote Administration" -ErrorAction Silent
 
 # 3. Check and temporarily change network connection profiles from Public to Private 
 # (Windows Firewall blocks remote WMI requests by default on Public network profiles)
+$changedProfiles = @()
 $profiles = Get-NetConnectionProfile
 foreach ($p in $profiles) {
     if ($p.NetworkCategory -eq "Public") {
         Write-Host "Temporarily changing Network Profile '$($p.Name)' from Public to Private..." -ForegroundColor Yellow
         Set-NetConnectionProfile -Name $p.Name -NetworkCategory Private
+        $changedProfiles += $p.Name
+    }
+}
+
+$tempFile = "$env:TEMP\ADShield_ChangedProfiles.txt"
+if ($changedProfiles.Count -gt 0) {
+    $changedProfiles | Out-File -FilePath $tempFile -Encoding utf8 -Force
+} else {
+    if (Test-Path $tempFile) {
+        Remove-Item -Path $tempFile -ErrorAction SilentlyContinue
     }
 }
 
