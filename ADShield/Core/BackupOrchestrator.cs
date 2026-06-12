@@ -59,10 +59,11 @@ public class BackupOrchestrator
         Log(progress, "INFO", $"Starting {backupType} backup sequence for {computerName}");
 
         // ── Step 1: Verify VeraCrypt volume ───────────────────────────────────
-        if (!VeraCryptManager.IsMounted(_settings.MountLetter))
+        bool isMounted = await Task.Run(() => VeraCryptManager.IsMounted(_settings.MountLetter), ct);
+        if (!isMounted)
         {
             Log(progress, "INFO", "VeraCrypt volume not mounted. Attempting to mount...");
-            VeraCryptManager.Mount(_settings, veraCryptPassword, progress);
+            await Task.Run(() => VeraCryptManager.Mount(_settings, veraCryptPassword, progress), ct);
         }
         else
         {
@@ -83,8 +84,13 @@ public class BackupOrchestrator
 
         // ── Step 3: WMI connectivity ──────────────────────────────────────────
         Log(progress, "INFO", "Verifying WMI remote administration access...");
-        if (!VssManager.TestWmiConnectivity(computerName, out var wmiError))
-            throw new Exception($"WMI not accessible on {computerName}: {wmiError}");
+        var wmiResult = await Task.Run(() =>
+        {
+            bool success = VssManager.TestWmiConnectivity(computerName, out var err);
+            return (success, err);
+        }, ct);
+        if (!wmiResult.success)
+            throw new Exception($"WMI not accessible on {computerName}: {wmiResult.err}");
         Log(progress, "SUCCESS", "WMI remote connection verified.");
         ct.ThrowIfCancellationRequested();
 
@@ -111,16 +117,19 @@ public class BackupOrchestrator
                 commands.Add($"\"{clientFolder}\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
             }
 
-            foreach (var args in commands)
+            await Task.Run(() =>
             {
-                var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                foreach (var args in commands)
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                };
-                using var proc = System.Diagnostics.Process.Start(psi);
-                proc?.WaitForExit();
-            }
+                    var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    using var proc = System.Diagnostics.Process.Start(psi);
+                    proc?.WaitForExit();
+                }
+            }, ct);
         }
         catch (Exception ex)
         {
@@ -284,31 +293,34 @@ public class BackupOrchestrator
                     commands.Add($"\"{vhdxDriveLetter}:\\.\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
                 }
 
-                foreach (var args in commands)
+                await Task.Run(() =>
                 {
-                    var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                    foreach (var args in commands)
                     {
-                        CreateNoWindow = true,
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    };
-                    using var proc = System.Diagnostics.Process.Start(psi);
-                    if (proc != null)
-                    {
-                        string stdout = proc.StandardOutput.ReadToEnd();
-                        string stderr = proc.StandardError.ReadToEnd();
-                        proc.WaitForExit();
-                        if (proc.ExitCode != 0)
+                        var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
                         {
-                            Log(progress, "WARN", $"icacls failed (code {proc.ExitCode}) for: {args}. Error: {stderr.Trim()} {stdout.Trim()}");
-                        }
-                        else
+                            CreateNoWindow = true,
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true
+                        };
+                        using var proc = System.Diagnostics.Process.Start(psi);
+                        if (proc != null)
                         {
-                            Log(progress, "INFO", $"icacls permission applied successfully: {args}");
+                            string stdout = proc.StandardOutput.ReadToEnd();
+                            string stderr = proc.StandardError.ReadToEnd();
+                            proc.WaitForExit();
+                            if (proc.ExitCode != 0)
+                            {
+                                Log(progress, "WARN", $"icacls failed (code {proc.ExitCode}) for: {args}. Error: {stderr.Trim()} {stdout.Trim()}");
+                            }
+                            else
+                            {
+                                Log(progress, "INFO", $"icacls permission applied successfully: {args}");
+                            }
                         }
                     }
-                }
+                }, ct);
             }
             catch (Exception ex)
             {
