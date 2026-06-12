@@ -30,9 +30,11 @@ public static class VeraCryptManager
         // Core Process.Start exception — VeraCrypt has no managed API
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName        = settings.VeraCryptExePath,
-            UseShellExecute = false,
-            CreateNoWindow  = false,  // Let VeraCrypt show errors if any
+            FileName         = settings.VeraCryptExePath,
+            UseShellExecute  = false,
+            CreateNoWindow   = true,   // suppress GUI — capture stderr instead
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
         };
         // ArgumentList handles quoting automatically — prevents password/path breakage
         foreach (var arg in new[]
@@ -40,12 +42,15 @@ public static class VeraCryptManager
             "/volume", containerPath,
             "/letter", settings.MountLetter,
             "/password", password,
-            "/silent", "/quit",
+            "/silent", "/quit", "/nowaitdlg",
         })
             psi.ArgumentList.Add(arg);
 
         using var proc = System.Diagnostics.Process.Start(psi)
             ?? throw new Exception("Failed to start VeraCrypt process.");
+
+        var stdout = proc.StandardOutput.ReadToEnd();
+        var stderr = proc.StandardError.ReadToEnd();
 
         bool exited = proc.WaitForExit(90_000); // 90s for network volumes
 
@@ -60,7 +65,8 @@ public static class VeraCryptManager
 
         if (proc.ExitCode != 0)
         {
-            progress?.Report($"[WARN] VeraCrypt exited with code {proc.ExitCode}. Waiting for drive registration...");
+            var vcOutput = $"{stdout.Trim()} {stderr.Trim()}".Trim();
+            progress?.Report($"[WARN] VeraCrypt exited with code {proc.ExitCode}. Output: {(string.IsNullOrEmpty(vcOutput) ? "(none)" : vcOutput)}");
         }
 
         // Network-hosted containers can take a few seconds after VeraCrypt exits
@@ -78,11 +84,15 @@ public static class VeraCryptManager
         }
 
         if (!mounted)
+        {
+            var vcOutput = $"{stdout.Trim()} {stderr.Trim()}".Trim();
             throw new Exception(
                 $"VeraCrypt mount did not succeed (exit code {proc.ExitCode}).\n" +
                 $"Container: {containerPath}\n" +
                 $"Drive letter: {settings.MountLetter}\n" +
+                $"VeraCrypt output: {(string.IsNullOrEmpty(vcOutput) ? "(none)" : vcOutput)}\n" +
                 "Check the passphrase and that the container file exists on the network.");
+        }
 
         progress?.Report($"[SUCCESS] VeraCrypt container mounted at {settings.MountLetter}:");
     }

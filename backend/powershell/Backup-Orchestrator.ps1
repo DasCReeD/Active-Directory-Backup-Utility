@@ -82,21 +82,18 @@ try {
         throw "WinRM is not accessible on target machine $ComputerName. Run 'winrm quickconfig' on client."
     }
 
-    # 4. Prepare local backup storage folder and share
+    # 4. Prepare local backup storage folder
     $backupRoot = "${VeraCryptLetter}:\backups"
     $clientFolder = Join-Path $backupRoot $ComputerName
+    if (-not (Test-Path $clientFolder)) {
+        New-Item -ItemType Directory -Path $clientFolder -Force | Out-Null
+    }
     $vhdxPath = Join-Path $clientFolder "disk.vhdx"
-    $shareName = "backup_${ComputerName}$"
-    
-    # Expose SMB Share
-    Write-Log "Configuring server SMB share $shareName..." "INFO"
-    & $vcScript -Action CreateShare -ComputerName $ComputerName -MountLetter $VeraCryptLetter
 
     # Create VHDX container on the server if it doesn't exist
     if (-not (Test-Path $vhdxPath)) {
         Write-Log "VHDX backup drive not found. Initializing a new dynamically expanding 1TB VHDX container..." "INFO"
         
-        # We write a temporary diskpart script to initialize the VHDX safely
         $diskpartScriptPath = Join-Path $clientFolder "create_vdisk.txt"
         $diskpartScript = @"
 create vdisk file="$vhdxPath" maximum=1048576 type=expandable
@@ -118,105 +115,140 @@ detach vdisk
         Write-Log "VHDX container initialized and formatted successfully." "SUCCESS"
     }
 
-    # 5. Remote orchestration via WinRM PSSession
-    Write-Log "Establishing WinRM remote session with $ComputerName..." "INFO"
-    $serverIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike "*Loopback*" })[0].IPAddress
-    $uncPath = "\\$serverIP\$shareName\disk.vhdx"
-
-    Write-Log "Remote connecting to mount target VHDX from UNC: $uncPath..." "INFO"
-
-    # Execute inside remote computer session
-    $remoteScript = {
-        param ($unc, $computer)
-        $ErrorActionPreference = "Stop"
-
-        # Check if already mounted
-        $diskpartCheckScript = @"
-select vdisk file="$unc"
-list vdisk
-"@
-        $check = $diskpartCheckScript | diskpart
-        
-        if ($check -match "Attached: Yes") {
-            # Already mounted, locate drive letter
-            $drive = Get-Volume -FileSystemLabel "Backup-$computer" -ErrorAction SilentlyContinue
-            if ($drive) { return $drive.DriveLetter + ":" }
-        }
-
-        # Mount VHDX
-        $mountScript = @"
-select vdisk file="$unc"
-attach vdisk
-"@
-        $mountScript | diskpart | Out-Null
-        Start-Sleep -Seconds 3
-
-        # Locate assigned volume letter
-        $volume = Get-Volume -FileSystemLabel "Backup-$computer" -ErrorAction SilentlyContinue
-        if (-not $volume) {
-            # Let's assign letter B: manually if none assigned
-            $assignScript = @"
-select vdisk file="$unc"
-select partition 1
-assign letter=B
-"@
-            $assignScript | diskpart | Out-Null
-            Start-Sleep -Seconds 2
-            $volume = Get-Volume -DriveLetter B -ErrorAction SilentlyContinue
-        }
-
-        if (-not $volume) {
-            throw "VHDX was attached but backup volume could not be identified."
-        }
-
-        return $volume.DriveLetter + ":"
-    }
-
-    $driveLetter = Invoke-Command -ComputerName $ComputerName -ScriptBlock $remoteScript -ArgumentList $uncPath, $ComputerName
-    Write-Log "Successfully mounted remote backup drive on $ComputerName at $driveLetter" "SUCCESS"
-
-    # 6. Run wbadmin backup
-    Write-Log "Triggering remote wbadmin system image backup (VSS-enabled) to $driveLetter..." "INFO"
+    # 5. Configure local temporary share adshield_temp$ for backup staging
+    $tempSharePath = "E:\adshield_temp"
+    $tempBackupDir = Join-Path $tempSharePath $ComputerName
     
-    # wbadmin needs to be run in a remote script block. We direct standard output into live logging
-    $backupScript = {
-        param ($targetDrive, $bType)
+    if (-not (Test-Path $tempSharePath)) {
+        New-Item -ItemType Directory -Path $tempSharePath -Force | Out-Null
+    }
+    
+    # Pre-create computer-specific temp folder
+    if (-not (Test-Path $tempBackupDir)) {
+        New-Item -ItemType Directory -Path $tempBackupDir -Force | Out-Null
+    }
+
+    Write-Log "Configuring temporary SMB share adshield_temp$..." "INFO"
+    $acl = Get-Acl $tempSharePath
+    $ar = New-Object System.Security.AccessControl.FileSystemAccessRule("SERVICEARCIT\Domain Computers", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $acl.SetAccessRule($ar)
+    Set-Acl $tempSharePath $acl
+
+    if (-not (Get-SmbShare -Name "adshield_temp$" -ErrorAction SilentlyContinue)) {
+        New-SmbShare -Name "adshield_temp$" -Path $tempSharePath -FullAccess "Domain Admins", "SERVICEARCIT\Domain Computers" -Description "ADShield Temp share" | Out-Null
+    }
+
+    # 6. Create and execute the Scheduled Task on the remote client
+    Write-Log "Creating and launching Scheduled Task on remote client $ComputerName..." "INFO"
+    $taskName = "ADShield_Backup_Run"
+    
+    $runBackupScript = {
+        param($targetComputer, $tName)
         $ErrorActionPreference = "Stop"
         
-        # Build command: wbadmin start backup -backuptarget:B: -include:c: -allcritical -quiet
-        # For client desktops, -allcritical includes system state and C:
-        $cmd = "wbadmin.exe start backup -backuptarget:$targetDrive -include:c: -allcritical -quiet"
+        # Build action executing wbadmin directly as SYSTEM
+        $action = New-ScheduledTaskAction -Execute "wbadmin.exe" -Argument "start backup -backuptarget:\\FILESVR\adshield_temp$\$targetComputer -include:c: -allcritical -quiet"
+        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount
+        $task = New-ScheduledTask -Action $action -Principal $principal
         
-        # Run process and capture console output stream
-        $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $cmd" -NoNewWindow -PassThru -Wait
+        Register-ScheduledTask -TaskName $tName -InputObject $task -Force | Out-Null
+        Start-ScheduledTask -TaskName $tName
         
-        if ($process.ExitCode -ne 0) {
-            throw "wbadmin failed with exit code $($process.ExitCode)."
+        # Poll task until complete
+        $timeoutSeconds = 7200 # 2 hours limit
+        $elapsed = 0
+        while ($true) {
+            Start-Sleep -Seconds 15
+            $elapsed += 15
+            $state = (Get-ScheduledTask -TaskName $tName).State
+            
+            if ($state -ne "Running") {
+                break
+            }
+            if ($elapsed -ge $timeoutSeconds) {
+                Stop-ScheduledTask -TaskName $tName | Out-Null
+                break
+            }
         }
-        return "Backup process completed successfully."
+        
+        $info = Get-ScheduledTask -TaskName $tName | Get-ScheduledTaskInfo
+        $result = $info.LastTaskResult
+        
+        Unregister-ScheduledTask -TaskName $tName -Confirm:$false | Out-Null
+        return $result
     }
 
-    $backupOutput = Invoke-Command -ComputerName $ComputerName -ScriptBlock $backupScript -ArgumentList $driveLetter, $BackupType
-    Write-Log "Remote Backup Engine: $backupOutput" "SUCCESS"
-
-    # 7. Unmount / Detach VHDX on remote client
-    Write-Log "Unmounting VHDX on remote client..." "INFO"
-    $unmountScript = {
-        param ($unc)
-        $unmountCommands = @"
-select vdisk file="$unc"
-detach vdisk
-"@
-        $unmountCommands | diskpart | Out-Null
-        return "Detached VHDX successfully."
+    $exitCode = Invoke-Command -ComputerName $ComputerName -ScriptBlock $runBackupScript -ArgumentList $ComputerName, $taskName
+    
+    # Since Invoke-Command returns output objects, we select the last item (the exit code)
+    $lastResult = $exitCode | Select-Object -Last 1
+    if ($lastResult -ne 0) {
+        throw "Remote backup task failed on client $ComputerName with exit code: $lastResult"
     }
-    $unmountOutput = Invoke-Command -ComputerName $ComputerName -ScriptBlock $unmountScript -ArgumentList $uncPath
-    Write-Log "Client cleanup: $unmountOutput" "SUCCESS"
+    Write-Log "Remote backup engine successfully completed on client." "SUCCESS"
 
-    # 8. Clean up dynamic SMB Share on Server
-    Write-Log "Revoking SMB Share $shareName..." "INFO"
-    & $vcScript -Action RemoveShare -ComputerName $ComputerName
+    # 7. Mount the local VHDX locally on the server
+    Write-Log "Mounting target VHDX locally on server..." "INFO"
+    
+    $mountLetter = "T"
+    # Dismount first if T: is already mounted from a previous run
+    if (Get-PSDrive -Name $mountLetter -ErrorAction SilentlyContinue) {
+        $dpDetach = 'select vdisk file=' + [char]34 + $vhdxPath + [char]34 + [char]10 + 'detach vdisk'
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        $dpDetach | Out-File -FilePath $tempFile -Encoding ascii -Force
+        diskpart /s $tempFile | Out-Null
+        Remove-Item $tempFile -Force
+        Start-Sleep -Seconds 2
+    }
+    
+    # Try partition 2 first (GPT), then partition 1 (MBR)
+    $dpMount = 'select vdisk file=' + [char]34 + $vhdxPath + [char]34 + [char]10 + 'attach vdisk' + [char]10 + 'select partition 2' + [char]10 + 'assign letter=' + $mountLetter + ' NOERR'
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    $dpMount | Out-File -FilePath $tempFile -Encoding ascii -Force
+    diskpart /s $tempFile | Out-Null
+    Remove-Item $tempFile -Force
+    Start-Sleep -Seconds 2
+    
+    if (-not (Get-PSDrive -Name $mountLetter -ErrorAction SilentlyContinue)) {
+        # Fallback to partition 1
+        $dpMount = 'select vdisk file=' + [char]34 + $vhdxPath + [char]34 + [char]10 + 'attach vdisk' + [char]10 + 'select partition 1' + [char]10 + 'assign letter=' + $mountLetter + ' NOERR'
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        $dpMount | Out-File -FilePath $tempFile -Encoding ascii -Force
+        diskpart /s $tempFile | Out-Null
+        Remove-Item $tempFile -Force
+        Start-Sleep -Seconds 2
+    }
+    
+    if (-not (Get-PSDrive -Name $mountLetter -ErrorAction SilentlyContinue)) {
+        throw "Failed to mount VHDX locally on server as drive ${mountLetter}:"
+    }
 
+    # 8. Copy WindowsImageBackup into the VHDX via Robocopy
+    Write-Log "Copying backup from temp staging into the encrypted VHDX..." "INFO"
+    $srcPath = Join-Path $tempBackupDir "WindowsImageBackup"
+    $destPath = "${mountLetter}:\WindowsImageBackup"
+    
+    # Execute Robocopy
+    $robocopyProcess = Start-Process -FilePath "robocopy.exe" -ArgumentList "`"$srcPath`" `"$destPath`" /E /COPY:DAT /R:1 /W:1 /NP /XJ" -NoNewWindow -PassThru -Wait
+    
+    # Robocopy exit codes < 8 indicate success or no changes
+    if ($robocopyProcess.ExitCode -ge 8) {
+        throw "Robocopy failed with exit code $($robocopyProcess.ExitCode)"
+    }
+    
+    # 9. Clean up and detach
+    Write-Log "Dismounting VHDX container..." "INFO"
+    $dpDetach = 'select vdisk file=' + [char]34 + $vhdxPath + [char]34 + [char]10 + 'detach vdisk'
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    $dpDetach | Out-File -FilePath $tempFile -Encoding ascii -Force
+    diskpart /s $tempFile | Out-Null
+    Remove-Item $tempFile -Force
+    
+    Write-Log "Cleaning up local temporary backup directory..." "INFO"
+    if (Test-Path $tempBackupDir) {
+        Remove-Item -Path $tempBackupDir -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    
     Write-Log "Backup process for $ComputerName completed successfully!" "SUCCESS"
     exit 0
 
@@ -225,16 +257,27 @@ detach vdisk
     
     # Cleanup attempts on failure
     try {
-        # Attempt client detach
+        # Unregister task on client if it exists
         if (Test-WSMan -ComputerName $ComputerName -ErrorAction SilentlyContinue) {
             Invoke-Command -ComputerName $ComputerName -ScriptBlock {
-                param ($unc)
-                $detachCmd = "select vdisk file=`"$unc`"`ndetach vdisk"
-                $detachCmd | diskpart | Out-Null
-            } -ArgumentList $uncPath -ErrorAction SilentlyContinue
+                param($tName)
+                Unregister-ScheduledTask -TaskName $tName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+            } -ArgumentList $taskName -ErrorAction SilentlyContinue
         }
-        # Attempt server share revocation
-        & $vcScript -Action RemoveShare -ComputerName $ComputerName -ErrorAction SilentlyContinue
+        
+        # Detach VHDX on server
+        if ($vhdxPath) {
+            $dpDetach = 'select vdisk file=' + [char]34 + $vhdxPath + [char]34 + [char]10 + 'detach vdisk'
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            $dpDetach | Out-File -FilePath $tempFile -Encoding ascii -Force
+            diskpart /s $tempFile | Out-Null
+            Remove-Item $tempFile -Force
+        }
+        
+        # Remove local temp backup dir
+        if ($tempBackupDir -and (Test-Path $tempBackupDir)) {
+            Remove-Item -Path $tempBackupDir -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+        }
     } catch {}
 
     exit 1

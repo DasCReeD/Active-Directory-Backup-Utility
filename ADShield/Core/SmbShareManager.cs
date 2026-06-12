@@ -82,6 +82,131 @@ public static class SmbShareManager
         return s.Get().Count > 0;
     }
 
+    /// <summary>Creates the temporary adshield_temp$ share for staging.</summary>
+    public static void CreateStagingShare(string sharePath, IProgress<string>? progress = null)
+    {
+        var shareName = "adshield_temp$";
+        progress?.Report($"[INFO] Configuring staging SMB share: {shareName} → {sharePath}");
+
+        // Ensure the directory exists
+        Directory.CreateDirectory(sharePath);
+
+        // Recreate it if it exists to refresh permissions
+        if (ShareExists(shareName))
+        {
+            progress?.Report($"[INFO] Staging share {shareName} already exists. Recreating to apply updated permissions...");
+            RemoveStagingShare(progress);
+            System.Threading.Thread.Sleep(1000);
+        }
+
+        using var shareClass = new ManagementClass("Win32_Share");
+        using var inParams   = shareClass.GetMethodParameters("Create");
+
+        inParams["Path"]        = sharePath;
+        inParams["Name"]        = shareName;
+        inParams["Type"]        = SHARE_TYPE_DISK;
+        inParams["MaximumAllowed"] = null;
+        inParams["Description"] = "ADShield Backup Temporary Staging Share";
+        inParams["Password"]    = null;
+        inParams["Access"]      = BuildStagingShareSecurityDescriptor();
+
+        using var outParams = shareClass.InvokeMethod("Create", inParams, null)
+            ?? throw new Exception("Win32_Share.Create returned null for staging share.");
+
+        var ret = Convert.ToUInt32(outParams["ReturnValue"]);
+        if (ret != 0)
+            throw new Exception($"Win32_Share.Create failed for '{shareName}'. Return: {ret}");
+
+        progress?.Report($"[SUCCESS] SMB share {shareName} created.");
+    }
+
+    /// <summary>Removes the temporary staging share.</summary>
+    public static void RemoveStagingShare(IProgress<string>? progress = null)
+    {
+        var shareName = "adshield_temp$";
+        progress?.Report($"[INFO] Revoking staging SMB share: {shareName}");
+
+        var query = new ObjectQuery($"SELECT * FROM Win32_Share WHERE Name = '{shareName}'");
+        using var searcher = new ManagementObjectSearcher(query);
+        bool found = false;
+        foreach (ManagementObject obj in searcher.Get())
+        {
+            obj.InvokeMethod("Delete", null);
+            found = true;
+        }
+        progress?.Report(found
+            ? $"[SUCCESS] SMB share {shareName} removed."
+            : $"[INFO] SMB share {shareName} did not exist.");
+    }
+
+    private static ManagementObject BuildStagingShareSecurityDescriptor()
+    {
+        var sd = new ManagementClass("Win32_SecurityDescriptor").CreateInstance();
+        var aces = new System.Collections.Generic.List<ManagementBaseObject>();
+
+        // ACE 1: Administrators (Full Control)
+        var aceAdmin = new ManagementClass("Win32_ACE").CreateInstance();
+        var trusteeAdmin = new ManagementClass("Win32_Trustee").CreateInstance();
+        trusteeAdmin["Name"]   = "Administrators";
+        trusteeAdmin["Domain"] = "BUILTIN";
+        aceAdmin["AccessMask"] = 0x1F01FF; // Full control
+        aceAdmin["AceFlags"]   = 3;        // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        aceAdmin["AceType"]    = 0;        // Allow
+        aceAdmin["Trustee"]    = trusteeAdmin;
+        aces.Add(aceAdmin);
+
+        // ACE 2: Everyone (Full Control)
+        var aceEveryone = new ManagementClass("Win32_ACE").CreateInstance();
+        var trusteeEveryone = new ManagementClass("Win32_Trustee").CreateInstance();
+        trusteeEveryone["Name"]   = "Everyone";
+        trusteeEveryone["Domain"] = null;
+        aceEveryone["AccessMask"] = 0x1F01FF; // Full control
+        aceEveryone["AceFlags"]   = 3;        // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        aceEveryone["AceType"]    = 0;        // Allow
+        aceEveryone["Trustee"]    = trusteeEveryone;
+        aces.Add(aceEveryone);
+
+        // ACE 3: Authenticated Users (Full Control)
+        try
+        {
+            var aceAuthUsers = new ManagementClass("Win32_ACE").CreateInstance();
+            var trusteeAuthUsers = new ManagementClass("Win32_Trustee").CreateInstance();
+            trusteeAuthUsers["Name"]   = "Authenticated Users";
+            trusteeAuthUsers["Domain"] = "NT AUTHORITY";
+            aceAuthUsers["AccessMask"] = 0x1F01FF;
+            aceAuthUsers["AceFlags"]   = 3;
+            aceAuthUsers["AceType"]    = 0;
+            aceAuthUsers["Trustee"]    = trusteeAuthUsers;
+            aces.Add(aceAuthUsers);
+        }
+        catch { }
+
+        // ACE 4: Domain Computers (Full Control)
+        var domainName = Environment.UserDomainName;
+        if (!string.IsNullOrEmpty(domainName))
+        {
+            try
+            {
+                var aceDomainComps = new ManagementClass("Win32_ACE").CreateInstance();
+                var trusteeDomainComps = new ManagementClass("Win32_Trustee").CreateInstance();
+                trusteeDomainComps["Name"]   = "Domain Computers";
+                trusteeDomainComps["Domain"] = domainName;
+                aceDomainComps["AccessMask"] = 0x1F01FF;
+                aceDomainComps["AceFlags"]   = 3;
+                aceDomainComps["AceType"]    = 0;
+                aceDomainComps["Trustee"] = trusteeDomainComps;
+                aces.Add(aceDomainComps);
+            }
+            catch { }
+        }
+
+        sd["DACL"]         = aces.ToArray();
+        sd["ControlFlags"] = 4;    // SE_DACL_PRESENT
+
+        return (ManagementObject)sd;
+    }
+
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>

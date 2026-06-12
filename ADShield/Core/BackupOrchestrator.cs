@@ -171,11 +171,13 @@ public class BackupOrchestrator
         }
         ct.ThrowIfCancellationRequested();
 
-        string? shadowId = null;
         bool vhdxMounted = false;
-        bool vssSymlinkCreated = false;
-        bool vssShareCreated = false;
+        bool taskRegistered = false;
         var vhdxDriveLetter = "B"; // temp letter for the VHDX locally on the backup server
+        var taskName = "ADShield_Backup_Run";
+        var remoteStateFile = @"C:\Windows\Temp\adshield_task_state.txt";
+        var remoteResultFile = @"C:\Windows\Temp\adshield_task_result.txt";
+        var tempBackupDir = Path.Combine(@"E:\adshield_temp", computerName);
 
         try
         {
@@ -313,67 +315,153 @@ public class BackupOrchestrator
                 Log(progress, "WARN", $"Could not set NTFS permissions on VHDX root drive {vhdxDriveLetter}:\\ : {ex.Message}");
             }
 
-            // ── Step 6b: VSS + Symlink + Hidden Share on Remote Client ────────
-            // Strategy: Create a VSS shadow copy, create a directory symlink to it,
-            // then share the symlink folder as a hidden SMB share.
-            // The SMB server on the client resolves the symlink locally, so the server
-            // can pull data through the share without needing R2L symlink traversal.
-            Log(progress, "INFO", $"Triggering VSS shadow copy on {computerName} (C:\\)...");
-            shadowId = await Task.Run(() =>
-                VssManager.CreateRemoteShadowCopy(computerName, @"C:\", progress: progress), ct);
-            Log(progress, "SUCCESS", $"VSS shadow copy created. ID: {shadowId}");
+            // ── Step 5b: Configure local temporary share adshield_temp$ ─────────────────
+            var tempSharePath = @"E:\adshield_temp";
+            
+            Directory.CreateDirectory(tempSharePath);
+            Directory.CreateDirectory(tempBackupDir);
+            
+            // Set NTFS permission on E:\adshield_temp using icacls
+            try
+            {
+                var domain = Environment.UserDomainName;
+                var args = $"\"{tempSharePath}\" /grant \"{domain}\\Domain Computers\":(OI)(CI)M /T";
+                var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                using var proc = System.Diagnostics.Process.Start(psi);
+                proc?.WaitForExit();
+            }
+            catch (Exception ex)
+            {
+                Log(progress, "WARN", $"Could not set NTFS permissions on staging folder: {ex.Message}");
+            }
+
+            Log(progress, "INFO", "Configuring temporary SMB share adshield_temp$...");
+            SmbShareManager.CreateStagingShare(tempSharePath, progress);
             ct.ThrowIfCancellationRequested();
 
-            Log(progress, "INFO", "Looking up VSS shadow device path...");
-            var shadowDevicePath = await Task.Run(() =>
-                GetShadowDevicePath(computerName, shadowId), ct);
-            Log(progress, "INFO", $"Shadow device: {shadowDevicePath}");
+            // ── Step 6: Create and execute the Scheduled Task on the remote client ──────
+            Log(progress, "INFO", $"Registering Scheduled Task on remote client {computerName}...");
+            
+            // Script block that registers and runs the scheduled task
+            var script = 
+                "$ErrorActionPreference = 'Stop'\n" +
+                "$action = New-ScheduledTaskAction -Execute 'wbadmin.exe' -Argument 'start backup -backuptarget:\\\\FILESVR\\adshield_temp$\\" + computerName + " -include:c: -allcritical -quiet'\n" +
+                "$principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\\SYSTEM' -LogonType ServiceAccount\n" +
+                "$task = New-ScheduledTask -Action $action -Principal $principal\n" +
+                "Register-ScheduledTask -TaskName '" + taskName + "' -InputObject $task -Force | Out-Null\n" +
+                "Start-ScheduledTask -TaskName '" + taskName + "'\n";
 
-            var tempLinkPath = @"C:\adshield_vss_link";
-            Log(progress, "INFO", $"Creating VSS symlink on {computerName}...");
-            await CreateRemoteVssSymlink(computerName, tempLinkPath, shadowDevicePath, progress, ct);
-            vssSymlinkCreated = true;
+            // Base64 encode the script for encoded execution (prevents quote/character escaping issues)
+            var bytes = System.Text.Encoding.Unicode.GetBytes(script);
+            var base64 = Convert.ToBase64String(bytes);
+            var runCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {base64}";
+            
+            RunRemoteWmiCommand(computerName, runCmd, 30000);
+            taskRegistered = true;
+            Log(progress, "SUCCESS", "Scheduled Task registered and started on remote client.");
             ct.ThrowIfCancellationRequested();
 
-            // ── Step 6c: Create hidden share pointing to the symlink folder ──────
-            var hiddenShareName = $"adshield_backup$";
-            Log(progress, "INFO", $"Creating hidden share \\\\{computerName}\\{hiddenShareName} → {tempLinkPath}...");
-            await Task.Run(() => CreateRemoteHiddenShare(computerName, hiddenShareName, tempLinkPath, progress), ct);
-            vssShareCreated = true;
-            ct.ThrowIfCancellationRequested();
+            // Poll task state
+            Log(progress, "INFO", "Monitoring remote backup progress...");
+            var timeoutSeconds = 7200; // 2 hours
+            var elapsed = 0;
+            var pollInterval = 15;
+            
+            var localStateFile  = $@"\\{computerName}\C$\Windows\Temp\adshield_task_state.txt";
+            var localResultFile  = $@"\\{computerName}\C$\Windows\Temp\adshield_task_result.txt";
 
-            // ── Step 6d: Validate share is accessible from server ─────────────────
-            var uncSource = $"\\\\{computerName}\\{hiddenShareName}";
-            Log(progress, "INFO", $"Validating server-side access to {uncSource}...");
-            bool pathAccessible = false;
-            for (int attempt = 1; attempt <= 5; attempt++)
+            while (true)
+            {
+                await Task.Delay(pollInterval * 1000, ct);
+                elapsed += pollInterval;
+
+                // Query task state remotely and write to file
+                var checkCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"(Get-ScheduledTask -TaskName '{taskName}').State | Out-File '{remoteStateFile}' -Encoding ascii -Force\"";
+                try
+                {
+                    RunRemoteWmiCommand(computerName, checkCmd, 15000);
+                }
+                catch (Exception ex)
+                {
+                    Log(progress, "WARN", $"Could not query task status: {ex.Message}");
+                }
+
+                string state = "Unknown";
+                if (File.Exists(localStateFile))
+                {
+                    try
+                    {
+                        state = File.ReadAllText(localStateFile).Trim();
+                    }
+                    catch { }
+                }
+
+                Log(progress, "INFO", $"Remote Task State: {state} ({elapsed} seconds elapsed)...");
+
+                if (state != "Running" && state != "Unknown")
+                {
+                    break;
+                }
+
+                if (elapsed >= timeoutSeconds)
+                {
+                    Log(progress, "WARN", "Backup timeout reached. Terminating remote task...");
+                    var stopCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Stop-ScheduledTask -TaskName '{taskName}'\"";
+                    try { RunRemoteWmiCommand(computerName, stopCmd, 10000); } catch { }
+                    break;
+                }
+            }
+
+            // Get exit status
+            var resultCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"(Get-ScheduledTask -TaskName '{taskName}' | Get-ScheduledTaskInfo).LastTaskResult | Out-File '{remoteResultFile}' -Encoding ascii -Force\"";
+            try { RunRemoteWmiCommand(computerName, resultCmd, 15000); } catch { }
+
+            uint exitCode = 999;
+            if (File.Exists(localResultFile))
             {
                 try
                 {
-                    if (Directory.Exists(uncSource))
+                    if (uint.TryParse(File.ReadAllText(localResultFile).Trim(), out var parsed))
                     {
-                        pathAccessible = true;
-                        Log(progress, "SUCCESS", $"Remote VSS share accessible on attempt {attempt}.");
-                        break;
+                        exitCode = parsed;
                     }
                 }
-                catch { /* ignore transient access errors */ }
-
-                Log(progress, "INFO", $"Share not yet accessible (attempt {attempt}/5), waiting 2s...");
-                await Task.Delay(2000, ct);
+                catch { }
             }
-            if (!pathAccessible)
+
+            Log(progress, "INFO", $"Remote task finished with Exit Code (LastTaskResult): {exitCode}");
+
+            // Unregister task and clean up remote state files
+            try
             {
-                throw new Exception(
-                    $"Cannot access {uncSource} after 5 attempts. " +
-                    "The hidden share on the client may not have been created properly.");
+                var cleanCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Unregister-ScheduledTask -TaskName '{taskName}' -Confirm:\\$false; Remove-Item -Path '{remoteStateFile}', '{remoteResultFile}' -Force -ErrorAction SilentlyContinue\"";
+                RunRemoteWmiCommand(computerName, cleanCmd, 15000);
+                taskRegistered = false;
+            }
+            catch (Exception ex)
+            {
+                Log(progress, "WARN", $"Could not clean up scheduled task on remote client: {ex.Message}");
             }
 
-            // ── Step 7: Server-pull robocopy from client share → local VHDX ──────
-            Log(progress, "INFO", $"Copying data: {uncSource} → {vhdxDriveLetter}:\\");
+            if (exitCode != 0)
+            {
+                throw new Exception($"wbadmin failed on remote client with exit code: {exitCode}");
+            }
+            Log(progress, "SUCCESS", "Remote wbadmin system image backup completed successfully.");
+            ct.ThrowIfCancellationRequested();
+
+            // ── Step 7: Local copy from staging directory into the mounted VHDX ──────
+            var srcPath = Path.Combine(tempBackupDir, "WindowsImageBackup");
+            var destPath = $"{vhdxDriveLetter}:\\WindowsImageBackup";
+
+            Log(progress, "INFO", $"Copying data into the encrypted VHDX: {srcPath} → {destPath}");
             Log(progress, "INFO", "This may take a while depending on data size. Please wait...");
-            await RunLocalDataCopy(uncSource, $"{vhdxDriveLetter}:\\", computerName, progress, ct);
-            Log(progress, "SUCCESS", "Server-pull data copy to virtual disk completed successfully.");
+            await RunLocalDataCopy(srcPath, destPath, computerName, progress, ct);
+            Log(progress, "SUCCESS", "Staged backup successfully copied and encrypted inside the virtual disk.");
             ct.ThrowIfCancellationRequested();
 
             // Persist result
@@ -387,31 +475,19 @@ public class BackupOrchestrator
         }
         finally
         {
-            // ── Step 8a: Remove hidden share on remote client ────────────────────
-            if (vssShareCreated)
+            // ── Cleanup remote scheduled task ───────────────────────────────────
+            if (taskRegistered)
             {
-                Log(progress, "INFO", "Cleaning up remote hidden share...");
-                try { await Task.Run(() => RemoveRemoteHiddenShare(computerName, "adshield_backup$", progress)); }
-                catch (Exception ex) { progress.Report($"[WARN] Could not remove hidden share: {ex.Message}"); }
+                Log(progress, "INFO", "Cleaning up remote Scheduled Task...");
+                try
+                {
+                    var cleanCmd = $"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Unregister-ScheduledTask -TaskName '{taskName}' -Confirm:\\$false; Remove-Item -Path '{remoteStateFile}', '{remoteResultFile}' -Force -ErrorAction SilentlyContinue\"";
+                    RunRemoteWmiCommand(computerName, cleanCmd, 15000);
+                }
+                catch (Exception ex) { progress.Report($"[WARN] Could not remove scheduled task: {ex.Message}"); }
             }
 
-            // ── Step 8b: Remove VSS symlink on remote client ─────────────────────
-            if (vssSymlinkCreated)
-            {
-                Log(progress, "INFO", "Cleaning up remote VSS symbolic link...");
-                try { await RemoveRemoteVssSymlink(computerName, @"C:\adshield_vss_link", progress, ct); }
-                catch (Exception ex) { progress.Report($"[WARN] Could not remove VSS symlink: {ex.Message}"); }
-            }
-
-            // ── Step 8c: Delete VSS shadow copy ──────────────────────────────────
-            if (shadowId != null)
-            {
-                Log(progress, "INFO", "Cleaning up remote VSS shadow copy...");
-                try { VssManager.DeleteShadowCopy(shadowId, progress); }
-                catch (Exception ex) { progress.Report($"[WARN] Could not delete shadow copy: {ex.Message}"); }
-            }
-
-            // ── Step 8d: Cleanup — detach VHDX locally ───────────────────────────
+            // ── Cleanup — detach VHDX locally ───────────────────────────
             if (vhdxMounted)
             {
                 Log(progress, "INFO", "Unmounting VHDX locally...");
@@ -419,6 +495,14 @@ public class BackupOrchestrator
                 try { await RunLocalDiskpart(detachScript, progress, ct); }
                 catch (Exception ex) { progress.Report($"[WARN] Could not unmount local VHDX: {ex.Message}"); }
                 Log(progress, "SUCCESS", "Local VHDX unmounted.");
+            }
+
+            // ── Clean up local staging folder ───────────────────────────
+            if (Directory.Exists(tempBackupDir))
+            {
+                Log(progress, "INFO", "Cleaning up temporary staging folder...");
+                try { Directory.Delete(tempBackupDir, true); }
+                catch (Exception ex) { progress.Report($"[WARN] Could not delete staging folder: {ex.Message}"); }
             }
         }
     }

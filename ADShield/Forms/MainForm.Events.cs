@@ -42,6 +42,43 @@ public partial class MainForm
         }
     }
 
+    private async Task RunBackupLogicTest()
+    {
+        var runConfirm = MessageBox.Show(
+            "This will execute the Backup Logic Test Suite.\n\n" +
+            "Tests include:\n" +
+            "• VHDX creation, GPT partitioning, and NTFS formatting\n" +
+            "• Existing VHDX re-mount using partition 2\n" +
+            "• Robocopy ArgumentList quoting (prevents B:\\ bug)\n" +
+            "• VeraCrypt mount detection and UNC path resolution\n" +
+            "• End-to-end local robocopy file copy\n\n" +
+            "Proceed with the test suite?",
+            "Backup Logic Tests", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+        if (runConfirm != DialogResult.Yes) return;
+
+        Log("INFO", "TEST", "Initializing Backup Logic Test Suite...");
+        try
+        {
+            Cursor = Cursors.WaitCursor;
+            var progress = new Progress<string>(msg => Log(msg, "TEST"));
+            var cts = new CancellationTokenSource();
+            await BackupLogicTest.RunAllTests(progress, cts.Token);
+            MessageBox.Show("Backup Logic Test Suite: ALL PASSED!\n\nVHDX, partitioning, robocopy, and mount detection all verified.",
+                "Tests Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR", "TEST", $"Backup logic tests failed: {ex.Message}");
+            MessageBox.Show($"Test suite failed:\n\n{ex.Message}",
+                "Tests Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
+        }
+    }
+
     private async Task SyncAd()
     {
         Log("INFO", "SYSTEM", "Starting Active Directory computer discovery...");

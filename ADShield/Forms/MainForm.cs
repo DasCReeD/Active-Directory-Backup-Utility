@@ -156,9 +156,12 @@ public partial class MainForm : Form
         btnSync.Width  = 186;
         btnSync.Click += async (_, _) => await SyncAd();
 
-        var btnTest = Theme.MakeButton("⚙  Run Self-Test");
+        var btnTest = Theme.MakeButton("⚙  Run Tests ▾");
         btnTest.Width  = 140;
-        btnTest.Click += async (_, _) => await RunDiagnosticsTest();
+        var testMenu = new ContextMenuStrip { BackColor = Theme.Surface, ForeColor = Theme.TextPrimary, Font = Theme.FontBase };
+        testMenu.Items.Add("VHDX Self-Healing Test", null, async (_, _) => await RunDiagnosticsTest());
+        testMenu.Items.Add("Backup Logic Test Suite", null, async (_, _) => await RunBackupLogicTest());
+        btnTest.Click += (_, _) => testMenu.Show(btnTest, new Point(0, btnTest.Height));
 
         var buttonsFlow = new FlowLayoutPanel
         {
