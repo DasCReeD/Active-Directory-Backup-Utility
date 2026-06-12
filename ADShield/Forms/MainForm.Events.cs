@@ -98,6 +98,52 @@ public partial class MainForm
         }
     }
 
+    private async Task RescanNetworkPings()
+    {
+        Log("INFO", "SYSTEM", "Rescanning network for active clients (pinging hosts)...");
+        try
+        {
+            Cursor = Cursors.WaitCursor;
+            
+            var tasks = _computers.Select(async c =>
+            {
+                bool online = false;
+                int pingMs = 0;
+                try
+                {
+                    using var ping = new System.Net.NetworkInformation.Ping();
+                    var reply = await ping.SendPingAsync(c.ComputerName, 800);
+                    if (reply.Status == System.Net.NetworkInformation.IPStatus.Success)
+                    {
+                        online = true;
+                        pingMs = (int)reply.RoundtripTime;
+                    }
+                }
+                catch { }
+                c.IsOnline = online;
+                c.PingMs = pingMs;
+            }).ToList();
+
+            await Task.WhenAll(tasks);
+
+            // Persist the updated online statuses to config file
+            AppConfig.SaveHistory(_computers);
+
+            RefreshGrids();
+            UpdateKpis();
+            int activeCount = _computers.Count(c => c.IsOnline);
+            Log("SUCCESS", "SYSTEM", $"Network status rescan complete. {activeCount} of {_computers.Count} clients active.");
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR", "SYSTEM", $"Network status rescan failed: {ex.Message}");
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
+        }
+    }
+
     // ── Backup trigger ────────────────────────────────────────────────────────
 
     private async Task TriggerBackup(string computerName)

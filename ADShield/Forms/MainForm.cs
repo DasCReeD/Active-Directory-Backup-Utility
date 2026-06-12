@@ -156,6 +156,10 @@ public partial class MainForm : Form
         btnSync.Width  = 186;
         btnSync.Click += async (_, _) => await SyncAd();
 
+        var btnRescan = Theme.MakeButton("⚡  Rescan Network");
+        btnRescan.Width = 160;
+        btnRescan.Click += async (_, _) => await RescanNetworkPings();
+
         var btnTest = Theme.MakeButton("⚙  Run Tests ▾");
         btnTest.Width  = 140;
         var testMenu = new ContextMenuStrip { BackColor = Theme.Surface, ForeColor = Theme.TextPrimary, Font = Theme.FontBase };
@@ -170,7 +174,7 @@ public partial class MainForm : Form
             Anchor = AnchorStyles.Right | AnchorStyles.Top,
             Padding = Padding.Empty, Margin = Padding.Empty
         };
-        buttonsFlow.Controls.AddRange(new Control[] { btnTest, btnSync });
+        buttonsFlow.Controls.AddRange(new Control[] { btnTest, btnRescan, btnSync });
 
         tbl.Controls.Add(_lblBreadcrumb, 0, 0);
         tbl.Controls.Add(buttonsFlow,    1, 0);
