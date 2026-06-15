@@ -43,7 +43,7 @@ namespace ADShield.Core
             if (!isMounted)
             {
                 Log(progress, "INFO", "VeraCrypt volume not mounted. Attempting to mount...");
-                await Task.Run(() => VeraCryptManager.Mount(_settings, veraCryptPassword, progress), ct);
+                await VeraCryptManager.MountAsync(_settings, veraCryptPassword, progress, ct);
             }
             else
             {
@@ -104,19 +104,10 @@ namespace ADShield.Core
                     commands.Add($"\"{clientFolder}\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
                 }
 
-                await Task.Run(() =>
+                foreach (var args in commands)
                 {
-                    foreach (var args in commands)
-                    {
-                        var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
-                        {
-                            CreateNoWindow = true,
-                            UseShellExecute = false
-                        };
-                        using var proc = System.Diagnostics.Process.Start(psi);
-                        proc?.WaitForExit();
-                    }
-                }, ct);
+                    await ProcessRunner.RunAsync("icacls.exe", arguments: args, ct: ct);
+                }
             }
             catch (Exception ex)
             {
@@ -275,34 +266,18 @@ namespace ADShield.Core
                         commands.Add($"\"{vhdxDriveLetter}:\\.\" /grant \"{domain}\\{computerName}$\":(OI)(CI)F /T");
                     }
 
-                    await Task.Run(() =>
+                    foreach (var args in commands)
                     {
-                        foreach (var args in commands)
+                        var result = await ProcessRunner.RunAsync("icacls.exe", arguments: args, ct: ct);
+                        if (result.ExitCode != 0)
                         {
-                            var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
-                            {
-                                CreateNoWindow = true,
-                                UseShellExecute = false,
-                                RedirectStandardOutput = true,
-                                RedirectStandardError = true
-                            };
-                            using var proc = System.Diagnostics.Process.Start(psi);
-                            if (proc != null)
-                            {
-                                string stdout = proc.StandardOutput.ReadToEnd();
-                                string stderr = proc.StandardError.ReadToEnd();
-                                proc.WaitForExit();
-                                if (proc.ExitCode != 0)
-                                {
-                                    Log(progress, "WARN", $"icacls failed (code {proc.ExitCode}) for: {args}. Error: {stderr.Trim()} {stdout.Trim()}");
-                                }
-                                else
-                                {
-                                    Log(progress, "INFO", $"icacls permission applied successfully: {args}");
-                                }
-                            }
+                            Log(progress, "WARN", $"icacls failed (code {result.ExitCode}) for: {args}. Error: {result.StandardError.Trim()} {result.StandardOutput.Trim()}");
                         }
-                    }, ct);
+                        else
+                        {
+                            Log(progress, "INFO", $"icacls permission applied successfully: {args}");
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -320,13 +295,7 @@ namespace ADShield.Core
                 {
                     var domain = Environment.UserDomainName;
                     var args = $"\"{tempSharePath}\" /grant \"{domain}\\Domain Computers\":(OI)(CI)M /T";
-                    var psi = new System.Diagnostics.ProcessStartInfo("icacls.exe", args)
-                    {
-                        CreateNoWindow = true,
-                        UseShellExecute = false
-                    };
-                    using var proc = System.Diagnostics.Process.Start(psi);
-                    proc?.WaitForExit();
+                    await ProcessRunner.RunAsync("icacls.exe", arguments: args, ct: ct);
                 }
                 catch (Exception ex)
                 {
@@ -455,38 +424,24 @@ namespace ADShield.Core
 
         internal static async Task RunLocalDiskpart(
             string diskpartScript,
-            IProgress<string> progress,
+            IProgress<string>? progress,
             CancellationToken ct)
         {
             var tempScript = Path.Combine(Path.GetTempPath(), $"adshield_{Guid.NewGuid():N}.txt");
             File.WriteAllText(tempScript, diskpartScript);
 
-            var logFile = Path.Combine(Path.GetTempPath(), $"adshield_diskpart_{Guid.NewGuid():N}.log");
-
             try
             {
-                var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c diskpart /s \"{tempScript}\" > \"{logFile}\" 2>&1")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                };
-                using var proc = System.Diagnostics.Process.Start(psi);
-                if (proc != null)
-                {
-                    await proc.WaitForExitAsync(ct);
-                }
+                var progressWrapper = progress != null ? new Progress<string>(line => progress.Report($"[INFO]   {line.Trim()}")) : null;
+                progress?.Report("[INFO] --- Local Diskpart Output ---");
 
-                if (File.Exists(logFile))
-                {
-                    progress?.Report("[INFO] --- Local Diskpart Output ---");
-                    var lines = File.ReadAllLines(logFile);
-                    foreach (var line in lines)
-                    {
-                        if (!string.IsNullOrWhiteSpace(line))
-                            progress?.Report($"[INFO]   {line.Trim()}");
-                    }
-                    progress?.Report("[INFO] -----------------------------");
-                }
+                await ProcessRunner.RunAsync(
+                    "diskpart.exe",
+                    arguments: $"/s \"{tempScript}\"",
+                    progress: progressWrapper,
+                    ct: ct);
+
+                progress?.Report("[INFO] -----------------------------");
             }
             catch (Exception ex)
             {
@@ -495,7 +450,6 @@ namespace ADShield.Core
             finally
             {
                 try { File.Delete(tempScript); } catch {}
-                try { File.Delete(logFile); } catch {}
             }
         }
 
@@ -508,48 +462,31 @@ namespace ADShield.Core
         {
             var logFile = Path.Combine(Path.GetTempPath(), $"adshield_robocopy_{computerName}.log");
 
-            var psi = new System.Diagnostics.ProcessStartInfo("robocopy.exe")
-            {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            foreach (var arg in new[]
+            var argumentList = new List<string>
             {
                 uncSource, localDest,
                 "/E", "/COPY:DAT", "/R:1", "/W:1", "/NP", "/XJ",
                 "/XD", "System Volume Information", "$Recycle.Bin", "$WinREAgent", "Recovery",
                 $"/LOG:{logFile}"
-            })
-                psi.ArgumentList.Add(arg);
+            };
 
-            Log(progress, "INFO", $"Server-pull robocopy: robocopy {string.Join(" ", psi.ArgumentList)}");
+            Log(progress, "INFO", $"Server-pull robocopy: robocopy {string.Join(" ", argumentList)}");
 
-            using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc == null)
-                throw new Exception("Failed to start local robocopy process.");
-
-            var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
-            var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeoutCts.CancelAfter(TimeSpan.FromHours(2));
-
+            ProcessRunnerResult result;
             try
             {
-                await proc.WaitForExitAsync(timeoutCts.Token);
+                result = await ProcessRunner.RunAsync(
+                    "robocopy.exe",
+                    argumentList: argumentList,
+                    timeout: TimeSpan.FromHours(2),
+                    ct: ct);
             }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            catch (TimeoutException)
             {
-                try { proc.Kill(entireProcessTree: true); } catch { }
                 throw new TimeoutException("Local robocopy did not complete within the 2 hour timeout.");
             }
 
-            var stdout = await stdoutTask;
-            var stderr = await stderrTask;
-
-            Log(progress, "INFO", $"Robocopy exited with code {proc.ExitCode}.");
+            Log(progress, "INFO", $"Robocopy exited with code {result.ExitCode}.");
 
             if (File.Exists(logFile))
             {
@@ -568,11 +505,11 @@ namespace ADShield.Core
                 }
             }
 
-            if (proc.ExitCode >= 8)
+            if (result.ExitCode >= 8)
             {
                 throw new Exception(
-                    $"Robocopy failed with exit code {proc.ExitCode}. " +
-                    $"Stdout: {stdout.Trim()} Stderr: {stderr.Trim()}");
+                    $"Robocopy failed with exit code {result.ExitCode}. " +
+                    $"Stdout: {result.StandardOutput.Trim()} Stderr: {result.StandardError.Trim()}");
             }
         }
 

@@ -26,7 +26,7 @@ public partial class MainForm
             Cursor = Cursors.WaitCursor;
             var progress = new Progress<string>(msg => Log(msg, "TEST"));
             var cts = new CancellationTokenSource();
-            await BackupSelfHealingTest.RunDiagnosticTest(progress, cts.Token);
+            await SelfHealingDiagnostics.RunDiagnosticsAsync(progress, cts.Token);
             MessageBox.Show("Self-Healing Diagnostic Test: SUCCESS!\n\nThe backup utility is 100% immune to RAW/uninitialized VHDX errors.",
                 "Diagnostics Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -63,7 +63,7 @@ public partial class MainForm
             Cursor = Cursors.WaitCursor;
             var progress = new Progress<string>(msg => Log(msg, "TEST"));
             var cts = new CancellationTokenSource();
-            await BackupLogicTest.RunAllTests(progress, cts.Token);
+            await BackupValidationSuite.RunValidationAsync(progress, cts.Token);
             MessageBox.Show("Backup Logic Test Suite: ALL PASSED!\n\nVHDX, partitioning, robocopy, and mount detection all verified.",
                 "Tests Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -218,7 +218,7 @@ public partial class MainForm
 
     // ── Create VeraCrypt Volume ────────────────────────────────────────────────
 
-    private void CreateVeraCryptVolume(string sizeSpec)
+    private async void CreateVeraCryptVolume(string sizeSpec)
     {
         // Validate inputs
         var exePath = _tbVcExe.Text.Trim();
@@ -311,7 +311,7 @@ public partial class MainForm
             Cursor = Cursors.WaitCursor;
             Log("INFO", "SYSTEM", $"Creating VeraCrypt container ({sizeSpec}) at {containerPath}...");
             var progress = new Progress<string>(msg => Log(msg));
-            VeraCryptManager.CreateContainer(_settings, tb1.Text, sizeSpec, progress);
+            await VeraCryptManager.CreateContainerAsync(_settings, tb1.Text, sizeSpec, progress);
             MessageBox.Show($"Encrypted volume created successfully!\n\n{containerPath}\nSize: {sizeSpec}",
                 "Volume Created", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }

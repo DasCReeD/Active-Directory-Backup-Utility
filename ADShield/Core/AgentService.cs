@@ -56,7 +56,7 @@ namespace ADShield.Core
         private string _status = "Idle"; // Idle, Running, Success, Failed
         private int _exitCode = 0;
         private readonly StringBuilder _progressLogs = new();
-        private Process? _activeProcess;
+        // Cancellation managed via CancellationToken
         private CancellationTokenSource? _backupCts;
 
         public AgentService()
@@ -284,7 +284,7 @@ namespace ADShield.Core
                     if (started)
                     {
                         // Launch backup in the background
-                        _ = Task.Run(() => RunWbadminBackupAsync(payload.BackupTarget, _backupCts.Token));
+                        _ = Task.Run(async () => await RunWbadminBackupAsync(payload.BackupTarget, _backupCts.Token));
                         
                         // Return 202 Accepted immediately
                         SendResponse(resp, HttpStatusCode.Accepted, "Accepted: Backup session started.");
@@ -307,7 +307,7 @@ namespace ADShield.Core
             }
         }
 
-        private void RunWbadminBackupAsync(string backupTarget, CancellationToken ct)
+        private async Task RunWbadminBackupAsync(string backupTarget, CancellationToken ct)
         {
             LogServiceEvent($"Starting local backup to target: '{backupTarget}'");
             
@@ -321,84 +321,37 @@ namespace ADShield.Core
 
             try
             {
-                var psi = new ProcessStartInfo("wbadmin.exe", args)
+                var progress = new Progress<string>(line =>
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
+                    lock (_stateLock)
+                    {
+                        _progressLogs.AppendLine(line);
+                    }
+                });
 
-                var proc = new Process { StartInfo = psi };
-                
+                var result = await ProcessRunner.RunAsync(
+                    "wbadmin.exe",
+                    arguments: args,
+                    progress: progress,
+                    ct: ct);
+
                 lock (_stateLock)
                 {
-                    _activeProcess = proc;
+                    _exitCode = result.ExitCode;
+                    _status = (result.ExitCode == 0) ? "Success" : "Failed";
+                    _progressLogs.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] wbadmin process finished with exit code: {result.ExitCode}");
                 }
-
-                proc.OutputDataReceived += (s, e) =>
+                LogServiceEvent($"Backup job completed. Status: {_status}, Exit Code: {result.ExitCode}");
+            }
+            catch (OperationCanceledException)
+            {
+                lock (_stateLock)
                 {
-                    if (e.Data != null)
-                    {
-                        lock (_stateLock)
-                        {
-                            _progressLogs.AppendLine(e.Data);
-                        }
-                    }
-                };
-
-                proc.ErrorDataReceived += (s, e) =>
-                {
-                    if (e.Data != null)
-                    {
-                        lock (_stateLock)
-                        {
-                            _progressLogs.AppendLine($"[STDERR] {e.Data}");
-                        }
-                    }
-                };
-
-                proc.Start();
-                proc.BeginOutputReadLine();
-                proc.BeginErrorReadLine();
-
-                // Wait for exit or cancellation
-                while (!proc.HasExited)
-                {
-                    if (ct.IsCancellationRequested)
-                    {
-                        LogServiceEvent("Cancellation requested. Terminating wbadmin process...");
-                        try
-                        {
-                            proc.Kill(true); // Kill entire process tree
-                        }
-                        catch { }
-                        break;
-                    }
-                    Thread.Sleep(500);
+                    _status = "Failed";
+                    _exitCode = -1;
+                    _progressLogs.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Backup session cancelled by server command.");
                 }
-
-                if (ct.IsCancellationRequested)
-                {
-                    lock (_stateLock)
-                    {
-                        _status = "Failed";
-                        _exitCode = -1;
-                        _progressLogs.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Backup session cancelled by server command.");
-                    }
-                    LogServiceEvent("Backup job cancelled successfully.");
-                }
-                else
-                {
-                    var exitCode = proc.ExitCode;
-                    lock (_stateLock)
-                    {
-                        _exitCode = exitCode;
-                        _status = (exitCode == 0) ? "Success" : "Failed";
-                        _progressLogs.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] wbadmin process finished with exit code: {exitCode}");
-                    }
-                    LogServiceEvent($"Backup job completed. Status: {_status}, Exit Code: {exitCode}");
-                }
+                LogServiceEvent("Backup job cancelled successfully.");
             }
             catch (Exception ex)
             {
@@ -411,14 +364,6 @@ namespace ADShield.Core
                 }
                 LogServiceEvent($"Fatal error during backup run: {ex.Message}\r\n{ex.StackTrace}");
             }
-            finally
-            {
-                lock (_stateLock)
-                {
-                    _activeProcess?.Dispose();
-                    _activeProcess = null;
-                }
-            }
         }
 
         private void CancelActiveBackup()
@@ -428,15 +373,6 @@ namespace ADShield.Core
                 if (_status == "Running")
                 {
                     _backupCts?.Cancel();
-                    
-                    if (_activeProcess != null)
-                    {
-                        try
-                        {
-                            _activeProcess.Kill(true);
-                        }
-                        catch { }
-                    }
                 }
             }
         }

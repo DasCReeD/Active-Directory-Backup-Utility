@@ -4,7 +4,10 @@ using ADShield.Models;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Diagnostics;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
+
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("ADShield.Tests")]
 
 namespace ADShield;
 
@@ -165,7 +168,7 @@ internal static class Program
                     if (dict.TryGetValue("container", out var con)) settings.VeraCryptContainer = con;
                     if (dict.TryGetValue("letter", out var let)) settings.MountLetter = let;
 
-                    VeraCryptManager.Mount(settings, password, progress);
+                    await VeraCryptManager.MountAsync(settings, password, progress);
                     break;
                 }
             case "dismount":
@@ -174,7 +177,7 @@ internal static class Program
                 {
                     if (dict.TryGetValue("letter", out var let)) settings.MountLetter = let;
 
-                    VeraCryptManager.Dismount(settings, progress);
+                    await VeraCryptManager.DismountAsync(settings, progress);
                     break;
                 }
             case "create":
@@ -186,7 +189,7 @@ internal static class Program
                     string size = GetParam("size", "10G");
 
                     settings.VeraCryptContainer = container;
-                    VeraCryptManager.CreateContainer(settings, password, size, progress);
+                    await VeraCryptManager.CreateContainerAsync(settings, password, size, progress);
                     break;
                 }
             case "discover":
@@ -209,8 +212,8 @@ internal static class Program
             case "-ts":
             case "--test":
                 {
-                    Console.WriteLine("Running Backup Logic Test Suite...");
-                    await BackupLogicTest.RunAllTests(progress, CancellationToken.None);
+                    Console.WriteLine("Running Backup Environment Validation...");
+                    await BackupValidationSuite.RunValidationAsync(progress, CancellationToken.None);
                     break;
                 }
             case "diagnostics":
@@ -218,7 +221,7 @@ internal static class Program
             case "--diagnostics":
                 {
                     Console.WriteLine("Running VHDX Self-Healing Diagnostics...");
-                    await BackupSelfHealingTest.RunDiagnosticTest(progress, CancellationToken.None);
+                    await SelfHealingDiagnostics.RunDiagnosticsAsync(progress, CancellationToken.None);
                     break;
                 }
             case "install":
@@ -231,14 +234,14 @@ internal static class Program
                     int port = 9099;
                     int.TryParse(portStr, out port);
 
-                    InstallAgentService(port, key, server);
+                    await InstallAgentServiceAsync(port, key, server);
                     break;
                 }
             case "uninstall":
             case "--uninstall":
             case "-u":
                 {
-                    UninstallAgentService();
+                    await UninstallAgentServiceAsync();
                     break;
                 }
             default:
@@ -247,7 +250,7 @@ internal static class Program
         }
     }
 
-    private static void InstallAgentService(int port, string key, string serverIp)
+    private static async Task InstallAgentServiceAsync(int port, string key, string serverIp)
     {
         Console.WriteLine("Installing ADShield client Windows Service...");
         
@@ -276,7 +279,7 @@ internal static class Program
 
         // Install service using sc.exe
         var binPath = $"\\\"{exePath}\\\" --service";
-        RunSystemProcess("sc.exe", $"create ADShieldAgent binPath= \"{binPath}\" start= auto DisplayName= \"ADShield Backup Agent\"");
+        await RunSystemProcessAsync("sc.exe", $"create ADShieldAgent binPath= \"{binPath}\" start= auto DisplayName= \"ADShield Backup Agent\"");
 
         // Configure Firewall
         string firewallArgs = $"advfirewall firewall add rule name=\"ADShield Agent\" dir=in action=allow protocol=TCP localport={port}";
@@ -284,24 +287,24 @@ internal static class Program
         {
             firewallArgs += $" remoteip={serverIp}";
         }
-        RunSystemProcess("netsh.exe", firewallArgs);
+        await RunSystemProcessAsync("netsh.exe", firewallArgs);
 
         // Start service
-        RunSystemProcess("sc.exe", "start ADShieldAgent");
+        await RunSystemProcessAsync("sc.exe", "start ADShieldAgent");
 
         Console.WriteLine("\nService installation process complete.");
     }
 
-    private static void UninstallAgentService()
+    private static async Task UninstallAgentServiceAsync()
     {
         Console.WriteLine("Uninstalling ADShield client Windows Service...");
 
         // Stop and Delete service
-        RunSystemProcess("sc.exe", "stop ADShieldAgent");
-        RunSystemProcess("sc.exe", "delete ADShieldAgent");
+        await RunSystemProcessAsync("sc.exe", "stop ADShieldAgent");
+        await RunSystemProcessAsync("sc.exe", "delete ADShieldAgent");
 
         // Remove Firewall exception
-        RunSystemProcess("netsh.exe", "advfirewall firewall delete rule name=\"ADShield Agent\"");
+        await RunSystemProcessAsync("netsh.exe", "advfirewall firewall delete rule name=\"ADShield Agent\"");
 
         // Clean up config file
         try
@@ -326,29 +329,16 @@ internal static class Program
         Console.WriteLine("\nService uninstallation process complete.");
     }
 
-    private static void RunSystemProcess(string fileName, string arguments)
+    private static async Task RunSystemProcessAsync(string fileName, string arguments)
     {
         Console.WriteLine($"\n> Executing: {fileName} {arguments}");
         try
         {
-            var psi = new ProcessStartInfo(fileName, arguments)
-            {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            using var proc = Process.Start(psi);
-            if (proc == null)
-            {
-                Console.WriteLine("[ERROR] Failed to start process.");
-                return;
-            }
-            proc.WaitForExit();
-            string output = proc.StandardOutput.ReadToEnd();
-            string error = proc.StandardError.ReadToEnd();
-            if (!string.IsNullOrWhiteSpace(output)) Console.WriteLine(output.Trim());
-            if (!string.IsNullOrWhiteSpace(error)) Console.WriteLine($"[ERROR] {error.Trim()}");
+            var result = await ProcessRunner.RunAsync(fileName, arguments: arguments);
+            if (!string.IsNullOrWhiteSpace(result.StandardOutput)) 
+                Console.WriteLine(result.StandardOutput.Trim());
+            if (!string.IsNullOrWhiteSpace(result.StandardError)) 
+                Console.WriteLine($"[ERROR] {result.StandardError.Trim()}");
         }
         catch (Exception ex)
         {

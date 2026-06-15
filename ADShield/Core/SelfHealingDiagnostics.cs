@@ -2,13 +2,12 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
 
 namespace ADShield.Core
 {
-    public static class BackupSelfHealingTest
+    public static class SelfHealingDiagnostics
     {
-        public static async Task RunDiagnosticTest(IProgress<string> progress, CancellationToken ct)
+        public static async Task RunDiagnosticsAsync(IProgress<string> progress, CancellationToken ct)
         {
             var testDriveLetter = "T"; // Temp letter for test drive
             var testFolder = @"V:\backups";

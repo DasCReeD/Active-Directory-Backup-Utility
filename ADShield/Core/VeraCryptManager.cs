@@ -1,3 +1,9 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using ADShield.Models;
 
 namespace ADShield.Core;
@@ -11,7 +17,7 @@ public static class VeraCryptManager
 {
     // ── Mount ─────────────────────────────────────────────────────────────────
 
-    public static void Mount(AppSettings settings, string password, IProgress<string>? progress = null)
+public static async Task MountAsync(AppSettings settings, string password, IProgress<string>? progress = null, CancellationToken ct = default)
     {
         if (!File.Exists(settings.VeraCryptExePath))
             throw new FileNotFoundException(
@@ -27,46 +33,25 @@ public static class VeraCryptManager
         var containerPath = ResolveUncPath(settings.VeraCryptContainer);
         progress?.Report($"[INFO] Mounting VeraCrypt container: {containerPath} → {settings.MountLetter}:");
 
-        // Core Process.Start exception — VeraCrypt has no managed API
-        var psi = new System.Diagnostics.ProcessStartInfo
-        {
-            FileName         = settings.VeraCryptExePath,
-            UseShellExecute  = false,
-            CreateNoWindow   = true,   // suppress GUI — capture stderr instead
-            RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-        };
-        // ArgumentList handles quoting automatically — prevents password/path breakage
-        foreach (var arg in new[]
+        var argumentList = new List<string>
         {
             "/volume", containerPath,
             "/letter", settings.MountLetter,
             "/password", password,
             "/silent", "/quit", "/nowaitdlg",
-        })
-            psi.ArgumentList.Add(arg);
+        };
 
-        using var proc = System.Diagnostics.Process.Start(psi)
-            ?? throw new Exception("Failed to start VeraCrypt process.");
+        var result = await ProcessRunner.RunAsync(
+            settings.VeraCryptExePath,
+            argumentList: argumentList,
+            timeout: TimeSpan.FromSeconds(90),
+            progress: progress,
+            ct: ct);
 
-        var stdout = proc.StandardOutput.ReadToEnd();
-        var stderr = proc.StandardError.ReadToEnd();
-
-        bool exited = proc.WaitForExit(90_000); // 90s for network volumes
-
-        if (!exited)
+        if (result.ExitCode != 0)
         {
-            try { proc.Kill(); } catch { }
-            throw new Exception(
-                $"VeraCrypt mount timed out after 90 seconds.\n" +
-                $"Container: {containerPath}\n" +
-                "The network share may be slow or unreachable.");
-        }
-
-        if (proc.ExitCode != 0)
-        {
-            var vcOutput = $"{stdout.Trim()} {stderr.Trim()}".Trim();
-            progress?.Report($"[WARN] VeraCrypt exited with code {proc.ExitCode}. Output: {(string.IsNullOrEmpty(vcOutput) ? "(none)" : vcOutput)}");
+            var vcOutput = $"{result.StandardOutput.Trim()} {result.StandardError.Trim()}".Trim();
+            progress?.Report($"[WARN] VeraCrypt exited with code {result.ExitCode}. Output: {(string.IsNullOrEmpty(vcOutput) ? "(none)" : vcOutput)}");
         }
 
         // Network-hosted containers can take a few seconds after VeraCrypt exits
@@ -80,14 +65,14 @@ public static class VeraCryptManager
                 break;
             }
             progress?.Report($"[INFO] Waiting for drive {settings.MountLetter}: to register (attempt {attempt}/10)...");
-            Thread.Sleep(1000);
+            await Task.Delay(1000, ct);
         }
 
         if (!mounted)
         {
-            var vcOutput = $"{stdout.Trim()} {stderr.Trim()}".Trim();
+            var vcOutput = $"{result.StandardOutput.Trim()} {result.StandardError.Trim()}".Trim();
             throw new Exception(
-                $"VeraCrypt mount did not succeed (exit code {proc.ExitCode}).\n" +
+                $"VeraCrypt mount did not succeed (exit code {result.ExitCode}).\n" +
                 $"Container: {containerPath}\n" +
                 $"Drive letter: {settings.MountLetter}\n" +
                 $"VeraCrypt output: {(string.IsNullOrEmpty(vcOutput) ? "(none)" : vcOutput)}\n" +
@@ -99,7 +84,7 @@ public static class VeraCryptManager
 
     // ── Dismount ──────────────────────────────────────────────────────────────
 
-    public static void Dismount(AppSettings settings, IProgress<string>? progress = null)
+    public static async Task DismountAsync(AppSettings settings, IProgress<string>? progress = null, CancellationToken ct = default)
     {
         if (!IsMounted(settings.MountLetter))
         {
@@ -109,18 +94,14 @@ public static class VeraCryptManager
 
         progress?.Report($"[INFO] Dismounting VeraCrypt volume {settings.MountLetter}:");
 
-        var psi = new System.Diagnostics.ProcessStartInfo
-        {
-            FileName        = settings.VeraCryptExePath,
-            UseShellExecute = false,
-            CreateNoWindow  = true,
-        };
-        foreach (var arg in new[] { "/dismount", settings.MountLetter, "/silent", "/quit" })
-            psi.ArgumentList.Add(arg);
+        var argumentList = new List<string> { "/dismount", settings.MountLetter, "/silent", "/quit" };
 
-        using var proc = System.Diagnostics.Process.Start(psi)
-            ?? throw new Exception("Failed to start VeraCrypt dismount process.");
-        proc.WaitForExit(30_000);
+        await ProcessRunner.RunAsync(
+            settings.VeraCryptExePath,
+            argumentList: argumentList,
+            timeout: TimeSpan.FromSeconds(30),
+            progress: progress,
+            ct: ct);
 
         progress?.Report(!IsMounted(settings.MountLetter)
             ? $"[SUCCESS] VeraCrypt volume {settings.MountLetter}: dismounted."
@@ -129,8 +110,8 @@ public static class VeraCryptManager
 
     // ── Create New Container ──────────────────────────────────────────────────
 
-    public static void CreateContainer(AppSettings settings, string password, string sizeSpec,
-        IProgress<string>? progress = null)
+    public static async Task CreateContainerAsync(AppSettings settings, string password, string sizeSpec,
+        IProgress<string>? progress = null, CancellationToken ct = default)
     {
         // Volume CREATION uses "VeraCrypt Format.exe", not the main VeraCrypt.exe
         var formatExe = Path.Combine(
@@ -152,14 +133,7 @@ public static class VeraCryptManager
         progress?.Report($"[INFO] Creating VeraCrypt container ({sizeSpec}) at {containerPath}...");
         progress?.Report($"[INFO] Using: {formatExe}");
 
-        var psi = new System.Diagnostics.ProcessStartInfo
-        {
-            FileName        = formatExe,
-            UseShellExecute = false,
-            CreateNoWindow  = false,  // Let VeraCrypt Format show its window for error visibility
-        };
-        // Use ArgumentList for reliable quoting
-        foreach (var arg in new[]
+        var argumentList = new List<string>
         {
             "/create", containerPath,
             "/size", sizeSpec,
@@ -169,21 +143,22 @@ public static class VeraCryptManager
             "/filesystem", "NTFS",
             "/force",
             "/silent",
-        })
-            psi.ArgumentList.Add(arg);
+        };
 
-        progress?.Report($"[INFO] Launching VeraCrypt Format — watch for its window...");
+        progress?.Report($"[INFO] Launching VeraCrypt Format — wait for completion...");
 
-        using var proc = System.Diagnostics.Process.Start(psi)
-            ?? throw new Exception("Failed to start VeraCrypt Format process.");
+        var result = await ProcessRunner.RunAsync(
+            formatExe,
+            argumentList: argumentList,
+            timeout: TimeSpan.FromMinutes(5),
+            progress: progress,
+            ct: ct);
 
-        proc.WaitForExit(300_000); // up to 5 min for very large volumes
-
-        progress?.Report($"[INFO] VeraCrypt Format exited with code {proc.ExitCode}");
+        progress?.Report($"[INFO] VeraCrypt Format exited with code {result.ExitCode}");
 
         if (!File.Exists(containerPath))
             throw new Exception(
-                $"VeraCrypt container creation failed (exit code {proc.ExitCode}).\n" +
+                $"VeraCrypt container creation failed (exit code {result.ExitCode}).\n" +
                 $"File not found: {containerPath}\n\n" +
                 "If VeraCrypt showed an error, note it and check:\n" +
                 "• Does the destination folder exist and is it writable?\n" +
