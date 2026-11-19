@@ -7,10 +7,32 @@ namespace ADShield.Core
 {
     public static class SelfHealingDiagnostics
     {
-        public static async Task RunDiagnosticsAsync(IProgress<string> progress, CancellationToken ct)
+        private static string GetFreeDriveLetter()
         {
-            var testDriveLetter = "T"; // Temp letter for test drive
-            var testFolder = @"V:\backups";
+            var used = new HashSet<char>(
+                DriveInfo.GetDrives().Select(d => char.ToUpperInvariant(d.Name[0])));
+            for (char c = 'Z'; c >= 'M'; c--)
+            {
+                if (!used.Contains(c))
+                    return c.ToString();
+            }
+            throw new InvalidOperationException("No free drive letters available in range Z..M for diagnostics.");
+        }
+
+        public static async Task RunDiagnosticsAsync(
+            IProgress<string> progress,
+            CancellationToken ct,
+            string? testFolderOverride = null)
+        {
+            var testDriveLetter = GetFreeDriveLetter();
+            var testFolder = testFolderOverride ?? AppConfig.ReadSettings().BackupRootPath;
+            var rootDrive = Path.GetPathRoot(testFolder);
+            if (string.IsNullOrEmpty(rootDrive) || !Directory.Exists(rootDrive))
+            {
+                var fallback = Path.Combine(Path.GetTempPath(), "adshield_self_heal_test");
+                progress.Report($"[TEST] Configured backup root '{testFolder}' is unavailable. Falling back to '{fallback}'.");
+                testFolder = fallback;
+            }
             var testVhdxPath = Path.Combine(testFolder, "self_healing_test.vhdx");
 
             progress.Report("[TEST] starting Active Directory Backup Self-Healing Diagnostic Test...");
@@ -48,15 +70,15 @@ namespace ADShield.Core
                 var attachScript = $"select vdisk file=\"{testVhdxPath}\"\r\nattach vdisk";
                 await BackupOrchestrator.RunLocalDiskpart(attachScript, progress, ct);
 
-                // 5. Map to drive letter T: (without formatting it!)
-                progress.Report("[TEST] 3. Mapping raw uninitialized volume to drive T:...");
+                // 5. Map to drive letter (without formatting it!)
+                progress.Report($"[TEST] 3. Mapping raw uninitialized volume to drive {testDriveLetter}:...");
                 var mapScript = 
                     $"select vdisk file=\"{testVhdxPath}\"\r\n" +
                     $"assign letter={testDriveLetter} NOERR\r\n";
                 await BackupOrchestrator.RunLocalDiskpart(mapScript, progress, ct);
 
-                // 6. Run write test on the RAW drive letter T:
-                progress.Report("[TEST] 4. Running write test on raw uninitialized T:\\ drive...");
+                // 6. Run write test on the RAW drive letter
+                progress.Report($"[TEST] 4. Running write test on raw uninitialized {testDriveLetter}:\\ drive...");
                 bool rawWriteResult = false;
                 try
                 {
@@ -106,9 +128,9 @@ namespace ADShield.Core
 
                 if (!formatWriteResult)
                 {
-                    throw new Exception("CRITICAL FAILURE: Drive T:\\ is still unformatted or un-writable after recovery formatting.");
+                    throw new Exception($"CRITICAL FAILURE: Drive {testDriveLetter}:\\ is still unformatted or un-writable after recovery formatting.");
                 }
-                progress.Report("[TEST] [SUCCESS] NTFS formatting completed and drive T:\\ is 100% writable!");
+                progress.Report($"[TEST] [SUCCESS] NTFS formatting completed and drive {testDriveLetter}:\\ is 100% writable!");
 
                 progress.Report("[TEST] [ALL PASSED] Self-Healing regression test completed successfully! The raw drive bug is fully prevented.");
             }

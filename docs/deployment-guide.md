@@ -21,17 +21,16 @@ This guide covers everything needed to deploy, configure, and operate **ADShield
 
 ### Target Client Requirements
 
+> **100% Agentless:** Zero software, Windows services, or HTTP listeners are installed on target computers. All prerequisites are configured centrally via Active Directory and Group Policy (GPO). See **[AGENTLESS_ROADMAP.md](AGENTLESS_ROADMAP.md)** Section 2 for full GPO details.
+
 | Requirement | Notes |
 |-------------|-------|
 | Domain member | Computer account must be in AD |
-| WMI enabled | Default on Windows; requires firewall exception |
-| Admin share (`C$`) accessible | Default on domain-joined machines with Domain Admin credentials |
-| No agent required | ADShield is 100% agentless |
-
-> **WMI Firewall Rule** — If clients have firewall restrictions, enable:
-> ```
-> netsh advfirewall firewall set rule group="Windows Management Instrumentation (WMI)" new enable=yes
-> ```
+| Dedicated AD Backup Account / gMSA | Member of local `Backup Operators` or `Administrators` with `SeBackupPrivilege` & `SeRestorePrivilege` via GPO |
+| Inbound WMI / DCOM / RPC | GPO firewall rules: `Windows Management Instrumentation (DCOM-In)` (TCP `135`) and `(WMI-In)` scoped to the Backup Server IP |
+| Inbound SMB (`445`) & Admin Share (`C$`) | GPO firewall rule `File and Printer Sharing (SMB-In)` scoped to the Backup Server IP |
+| ICMPv4 Echo Request | Required for server pre-flight ping and `AdDiscovery` |
+| R2L Symlink Evaluation GPO | Enable `Allow Remote-to-Local symbolic links` via Computer Configuration GPO |
 
 ---
 
@@ -140,9 +139,11 @@ Click **↻ Sync Active Directory** in the top header. ADShield will:
 3. Configure cron expressions:
    - **Nightly Incremental** — default `0 1 * * *` (01:00 AM daily)
    - **Weekly Full** — default `0 0 * * 0` (Sunday midnight)
-4. Click **Save AD Settings**
+4. Configure **Max Concurrent Backups** (default `1`) to bound parallel server-pull jobs
+5. *(Optional)* Enable **Allow Unattended Vault Mount** and save the VeraCrypt passphrase (encrypted on disk via Windows DPAPI in `%AppData%\ADShield\vault.dat`) so scheduled jobs can mount a locked vault without interactive prompts
+6. Click **Save AD Settings**
 
-> ⚠️ **Note:** The VeraCrypt passphrase must be pre-configured in memory for scheduled backups to work. Ensure the vault is mounted before scheduled jobs fire, or ADShield will attempt to mount it automatically (requiring a stored credential mechanism in future versions).
+> ⚠️ **Note:** If the vault is locked and `AllowUnattendedVaultMount` is disabled (or no DPAPI passphrase is saved), scheduled backups will log an `[ERROR]` and skip without blocking on a modal dialog.
 
 ### Running the Self-Healing Diagnostic
 
@@ -165,30 +166,25 @@ Backup Initiated
 VeraCrypt vault mounted (V:\)
     │
     ▼
-Per-machine VHDX created (V:\backups\PC-NAME\disk.vhdx)
-    │  (sized to remote C: usage + 20% headroom)
+Target PC pinged & WMI connectivity verified (VssManager.TestWmiConnectivity)
     │
     ▼
-VHDX attached locally as B:\
-    │  (NTFS formatted, self-heals if RAW)
+Per-machine VHDX created (V:\backups\PC-NAME\disk.vhdx) with Administrators/SYSTEM ACLs
+    │  (sized to remote C: usage * 1.2, min 10 GB, capped at 90% vault free space)
+    ▼
+Free drive letter allocated (Z..M), VHDX attached via VirtDisk.dll & formatted/assigned
+    │  (self-heals if RAW)
+    ▼
+Remote VSS shadow copy created on target PC via WMI (Win32_ShadowCopy)
     │
     ▼
-R2L symlink evaluation enabled on target PC (WMI registry write)
+Temporary symlink created on target PC: C:\_adshield_vss_<id> -> DeviceObject
     │
     ▼
-VSS shadow copy triggered on target PC via WMI
-    │
+Robocopy runs LOCALLY on server: \\PC-NAME\C$\_adshield_vss_<id> -> <Drive>:\<BackupType>\
+    │  (2-hour timeout, /B backup mode)
     ▼
-Symlink created on target PC: C:\adshield_vss_link → VSS shadow
-    │
-    ▼
-Robocopy runs LOCALLY on server, pulling from \\PC-NAME\C$\adshield_vss_link → B:\
-    │  (2-hour timeout, /B backup mode, excludes: System Volume Information, $Recycle.Bin)
-    │
-    ▼
-Symlink removed on target PC
-VSS shadow copy deleted
-VHDX detached
+Remote symlink removed, remote VSS shadow deleted, VHDX detached (finally block)
     │
     ▼
 history.json updated: LastBackupStatus = "Success"
@@ -214,7 +210,9 @@ Location: `%AppData%\ADShield\config.json`
   "ScheduleActive": false,
   "NightlyCron": "0 1 * * *",
   "WeeklyCron": "0 0 * * 0",
-  "DomainAdminContext": true
+  "DomainAdminContext": true,
+  "MaxConcurrentBackups": 1,
+  "AllowUnattendedVaultMount": false
 }
 ```
 
@@ -231,6 +229,7 @@ Location: `%AppData%\ADShield\history.json`
     "OperatingSystem": "Windows 11 Pro",
     "IsOnline": true,
     "PingMs": 4,
+    "IPAddress": "192.168.1.50",
     "LastBackupStatus": "Success",
     "LastBackupTime": "2025-05-22T01:03:47"
   }
@@ -250,29 +249,29 @@ Location: `%AppData%\ADShield\history.json`
 | `Mount did not succeed` | Container file missing | Verify the `.hc` file path is correct |
 | Container on mapped drive fails | Elevated process can't see mapped drives | Use the UNC path directly (`\\server\share\vault.hc`) — ADShield auto-resolves this |
 
-### Target Computer Unreachable
+### Target Computer Unreachable / WMI Errors
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `ICMP failed` | Computer offline or ICMP blocked | Verify ping from server; check Windows Firewall on client |
-| `WMI not accessible` | WMI service or firewall | Enable WMI firewall rule on target; run `winrm quickconfig` |
-| `Access denied` | Not running as Domain Admin | Run ADShield.exe as Administrator with a Domain Admin account |
+| `ICMP failed` | Computer offline or ICMP blocked | Verify ping from server; check GPO `Echo Request - ICMPv4-In` rule on target |
+| `WMI not accessible` | WMI service or firewall blocked | Verify `Winmgmt` is running and GPO WMI/DCOM firewall rules allow the backup server IP |
+| `Access denied` | Insufficient privileges on target | Ensure the AD backup service account / gMSA has local `Administrators` or `Backup Operators` + WMI permissions |
 
 ### VHDX / Disk Issues
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Failed to mount, format and write to local drive B:\` | diskpart permission issue | Ensure ADShield runs as Administrator |
-| Drive `B:` already in use | Previous backup didn't cleanup | Open Disk Management, detach the disk manually |
+| `Failed to mount, format and write to local drive` | `diskpart` or `VirtDisk` permission issue | Ensure ADShield runs as Administrator |
+| No free drive letters (`Z`–`M`) | All letters `Z` down to `M` are in use | Detach unused virtual disks in Disk Management |
 | `HRESULT: 0x80070005` from VirtDisk | Access denied | Run as Administrator |
 
-### Robocopy Errors
+### Robocopy & VSS Errors
 
 | Error Code | Meaning | Action |
 |------------|---------|--------|
-| `ERROR 53` | Network path not found | Admin share not accessible; verify Domain Admin credentials and `C$` accessibility |
-| `ERROR 5` | Access denied | R2L symlink evaluation may not be enabled; check ADShield logs for R2L step |
-| `ERROR 3` | Path not found | VSS shadow symlink may have failed; check earlier log steps |
+| `ERROR 53` | Network path not found | Verify `C$` admin share and SMB port `445` are reachable from the backup server |
+| `ERROR 5` | Access denied / R2L blocked | Verify the **Remote-to-Local (R2L) symbolic link evaluation** GPO is applied on the target |
+| `ERROR 3` | Path not found | VSS shadow copy or symlink creation failed; inspect earlier `[ERROR]`/`[WARN]` log lines |
 | Exit code ≥ 8 | Robocopy failure | Check the log file at `%TEMP%\adshield_robocopy_<COMPUTERNAME>.log` on the **backup server** |
 
 > Robocopy runs locally on the backup server. Log files are saved to `%TEMP%\adshield_robocopy_<COMPUTERNAME>.log` on the **server** machine, not the client.

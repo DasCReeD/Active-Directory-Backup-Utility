@@ -114,6 +114,69 @@ public static class VssManager
         progress?.Report("[SUCCESS] Shadow copy deleted.");
     }
 
+    // ── Remote Query / Delete / Connectivity ─────────────────────────────────
+
+    private static ManagementScope CreateRemoteScope(string computerName, int timeoutSeconds = 10)
+    {
+        var options = new ConnectionOptions
+        {
+            Impersonation = ImpersonationLevel.Impersonate,
+            EnablePrivileges = true,
+            Timeout = TimeSpan.FromSeconds(timeoutSeconds)
+        };
+        var scope = new ManagementScope($@"\\{computerName}\root\cimv2", options);
+        scope.Connect();
+        return scope;
+    }
+
+    /// <summary>Gets the DeviceObject path (with trailing backslash) for a remote VSS shadow copy.</summary>
+    public static string GetShadowCopyDeviceObject(string computerName, string shadowId)
+    {
+        var scope = CreateRemoteScope(computerName);
+        var query = new ObjectQuery($"SELECT DeviceObject FROM Win32_ShadowCopy WHERE ID = '{shadowId}'");
+        using var searcher = new ManagementObjectSearcher(scope, query);
+        foreach (ManagementObject obj in searcher.Get())
+        {
+            var deviceObject = obj["DeviceObject"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(deviceObject))
+                return deviceObject.EndsWith("\\") ? deviceObject : deviceObject + "\\";
+        }
+        throw new Exception($"Shadow copy '{shadowId}' was not found on {computerName} or has no DeviceObject.");
+    }
+
+    /// <summary>Deletes a VSS shadow copy on a remote machine via WMI.</summary>
+    public static void DeleteRemoteShadowCopy(string computerName, string shadowId, IProgress<string>? progress = null)
+    {
+        progress?.Report($"[INFO] Deleting remote shadow copy {shadowId} on {computerName}...");
+        var scope = CreateRemoteScope(computerName);
+        var query = new ObjectQuery($"SELECT * FROM Win32_ShadowCopy WHERE ID = '{shadowId}'");
+        using var searcher = new ManagementObjectSearcher(scope, query);
+        foreach (ManagementObject obj in searcher.Get())
+            obj.Delete();
+        progress?.Report($"[SUCCESS] Remote shadow copy {shadowId} deleted on {computerName}.");
+    }
+
+    /// <summary>Queries used and total disk space (in GB) on a remote machine via Win32_LogicalDisk.</summary>
+    public static (double usedGb, double totalGb) QueryRemoteDiskSpace(string computerName, string drive = "C:")
+    {
+        var deviceId = drive.TrimEnd('\\').ToUpperInvariant();
+        if (deviceId.Length == 1) deviceId += ":";
+
+        var scope = CreateRemoteScope(computerName);
+        var query = new ObjectQuery($"SELECT Size, FreeSpace FROM Win32_LogicalDisk WHERE DeviceID = '{deviceId}'");
+        using var searcher = new ManagementObjectSearcher(scope, query);
+        foreach (ManagementObject obj in searcher.Get())
+        {
+            var sizeBytes = Convert.ToDouble(obj["Size"] ?? 0);
+            var freeBytes = Convert.ToDouble(obj["FreeSpace"] ?? 0);
+            const double bytesPerGb = 1024.0 * 1024.0 * 1024.0;
+            double totalGb = sizeBytes / bytesPerGb;
+            double usedGb = (sizeBytes - freeBytes) / bytesPerGb;
+            return (usedGb, totalGb);
+        }
+        throw new Exception($"Logical disk '{deviceId}' not found on {computerName}.");
+    }
+
     // ── Test WMI Connectivity ─────────────────────────────────────────────────
 
     public static bool TestWmiConnectivity(string computerName, out string error)
@@ -121,18 +184,13 @@ public static class VssManager
         error = string.Empty;
         try
         {
-            var settings = AppConfig.ReadSettings();
-            using var client = new System.Net.Http.HttpClient();
-            client.Timeout = TimeSpan.FromSeconds(5);
-            client.DefaultRequestHeaders.Add("X-ADShield-Key", settings.AgentApiKey);
-
-            var url = $"http://{computerName}:{settings.AgentPort}/status";
-            var response = client.GetAsync(url).Result;
-            if (response.IsSuccessStatusCode)
-            {
+            var scope = CreateRemoteScope(computerName, timeoutSeconds: 10);
+            var query = new ObjectQuery("SELECT Caption FROM Win32_OperatingSystem");
+            using var searcher = new ManagementObjectSearcher(scope, query);
+            foreach (ManagementObject _ in searcher.Get())
                 return true;
-            }
-            error = $"HTTP status code: {response.StatusCode}";
+
+            error = "WMI connected but Win32_OperatingSystem returned no results.";
             return false;
         }
         catch (Exception ex)

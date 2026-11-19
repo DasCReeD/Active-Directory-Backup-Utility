@@ -25,9 +25,9 @@ public class AppSettings
 
     public bool DomainAdminContext { get; set; } = true;
 
-    // ── Client Agent Connection Settings
-    public int    AgentPort   { get; set; } = 9099;
-    public string AgentApiKey { get; set; } = "ADShieldDefaultApiKeySecret_ChangeMe";
+    // ── Concurrency & Security
+    public int  MaxConcurrentBackups      { get; set; } = 1;
+    public bool AllowUnattendedVaultMount { get; set; } = false;
 
     // Computed helper: full path to backup root on the mounted drive
     public string BackupRootPath =>

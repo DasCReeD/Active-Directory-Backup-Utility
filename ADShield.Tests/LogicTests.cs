@@ -106,12 +106,8 @@ namespace ADShield.Tests
                     "format fs=ntfs label=\"ExistTest\" quick\r\n";
                 await BackupOrchestrator.RunLocalDiskpart(initScript, null, CancellationToken.None);
 
-                // Write a marker file
-                var assignScript =
-                    $"select vdisk file=\"{vhdxPath}\"\r\n" +
-                    $"select partition 2\r\n" +
-                    $"assign letter={driveLetter} NOERR\r\n";
-                await BackupOrchestrator.RunLocalDiskpart(assignScript, null, CancellationToken.None);
+                // Write a marker file (20 MB GPT disks may have only partition 1; larger GPT disks have MSR + partition 2)
+                await BackupOrchestrator.AssignExistingVhdxLetterAsync(vhdxPath, driveLetter, null, CancellationToken.None);
 
                 var markerFile = Path.Combine($"{driveLetter}:\\", "existing_marker.txt");
                 File.WriteAllText(markerFile, "marker_data_12345");
@@ -120,18 +116,13 @@ namespace ADShield.Tests
                 var detachScript = $"select vdisk file=\"{vhdxPath}\"\r\ndetach vdisk";
                 await BackupOrchestrator.RunLocalDiskpart(detachScript, null, CancellationToken.None);
 
-                // Re-mount using partition 2 sequence
+                // Re-mount using existing partition assignment helper (partition 2 -> fallback partition 1)
                 var remountScript =
                     $"select vdisk file=\"{vhdxPath}\"\r\n" +
                     "attach vdisk\r\n";
                 await BackupOrchestrator.RunLocalDiskpart(remountScript, null, CancellationToken.None);
 
-                var mountScript =
-                    $"select vdisk file=\"{vhdxPath}\"\r\n" +
-                    "online disk NOERR\r\n" +
-                    "select partition 2\r\n" +
-                    $"assign letter={driveLetter} NOERR\r\n";
-                await BackupOrchestrator.RunLocalDiskpart(mountScript, null, CancellationToken.None);
+                await BackupOrchestrator.AssignExistingVhdxLetterAsync(vhdxPath, driveLetter, null, CancellationToken.None);
 
                 // Verify the marker file survived
                 Assert.True(File.Exists(markerFile));

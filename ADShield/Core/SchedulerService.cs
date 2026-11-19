@@ -10,7 +10,10 @@ public class SchedulerService : IDisposable
 {
     private System.Threading.Timer?   _nightlyTimer;
     private System.Threading.Timer?   _weeklyTimer;
-    private readonly AppSettings _settings;
+    private readonly AppSettings      _settings;
+    private readonly object           _lock = new();
+    private int                       _firing;
+    private volatile bool             _active;
 
     public event Action<string>? BackupTriggered; // raises with backupType "Incremental"|"Full"
 
@@ -24,16 +27,24 @@ public class SchedulerService : IDisposable
         Stop();
         if (!_settings.ScheduleActive) return;
 
-        ScheduleNightly();
-        ScheduleWeekly();
+        lock (_lock)
+        {
+            _active = true;
+            ScheduleNightly();
+            ScheduleWeekly();
+        }
     }
 
     public void Stop()
     {
-        _nightlyTimer?.Dispose();
-        _weeklyTimer?.Dispose();
-        _nightlyTimer = null;
-        _weeklyTimer  = null;
+        lock (_lock)
+        {
+            _active = false;
+            _nightlyTimer?.Dispose();
+            _weeklyTimer?.Dispose();
+            _nightlyTimer = null;
+            _weeklyTimer  = null;
+        }
     }
 
     // ── Nightly Incremental ───────────────────────────────────────────────────
@@ -44,9 +55,7 @@ public class SchedulerService : IDisposable
         var delay = DelayUntil(hour, minute);
         _nightlyTimer = new System.Threading.Timer(_ =>
         {
-            BackupTriggered?.Invoke("Incremental");
-            // Reschedule for next day
-            ScheduleNightly();
+            OnTimerFired("Incremental", ScheduleNightly);
         }, null, delay, Timeout.InfiniteTimeSpan);
     }
 
@@ -58,21 +67,53 @@ public class SchedulerService : IDisposable
         var delay = DelayUntilWeekly(DayOfWeek.Sunday, hour, minute);
         _weeklyTimer = new System.Threading.Timer(_ =>
         {
-            BackupTriggered?.Invoke("Full");
-            ScheduleWeekly();
+            OnTimerFired("Full", ScheduleWeekly);
         }, null, delay, Timeout.InfiniteTimeSpan);
+    }
+
+    private void OnTimerFired(string backupType, Action reschedule)
+    {
+        if (!_active) return;
+
+        // Guard against re-entrancy / overlapping timer callbacks
+        if (Interlocked.Exchange(ref _firing, 1) == 1)
+        {
+            lock (_lock)
+            {
+                if (_active) reschedule();
+            }
+            return;
+        }
+
+        try
+        {
+            if (_active)
+                BackupTriggered?.Invoke(backupType);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _firing, 0);
+            lock (_lock)
+            {
+                if (_active) reschedule();
+            }
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>Parses the minute and hour fields from a 5-field cron string.</summary>
-    private static (int hour, int minute) ParseCronHM(string cron, int defaultHour)
+    public static (int hour, int minute) ParseCronHM(string cron, int defaultHour)
     {
         try
         {
-            var parts = cron.Trim().Split(' ');
+            if (string.IsNullOrWhiteSpace(cron)) return (defaultHour, 0);
+            var parts = cron.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) return (defaultHour, 0);
             int minute = int.Parse(parts[0]);
             int hour   = int.Parse(parts[1]);
+            if (minute < 0 || minute > 59 || hour < 0 || hour > 23)
+                return (defaultHour, 0);
             return (hour, minute);
         }
         catch

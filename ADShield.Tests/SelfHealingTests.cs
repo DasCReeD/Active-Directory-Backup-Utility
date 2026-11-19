@@ -32,7 +32,8 @@ namespace ADShield.Tests
 
             // Note: This test requires administrative privileges (diskpart operations)
             var progress = new Progress<string>(msg => Console.WriteLine(msg));
-            await SelfHealingDiagnostics.RunDiagnosticsAsync(progress, CancellationToken.None);
+            var testFolder = Path.Combine(Path.GetTempPath(), "adshield_self_heal_test");
+            await SelfHealingDiagnostics.RunDiagnosticsAsync(progress, CancellationToken.None, testFolder);
         }
     }
 }

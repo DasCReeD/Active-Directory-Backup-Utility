@@ -49,7 +49,7 @@ public partial class MainForm
             "Tests include:\n" +
             "• VHDX creation, GPT partitioning, and NTFS formatting\n" +
             "• Existing VHDX re-mount using partition 2\n" +
-            "• Robocopy ArgumentList quoting (prevents B:\\ bug)\n" +
+            "• Robocopy ArgumentList quoting and dynamic drive-letter handling\n" +
             "• VeraCrypt mount detection and UNC path resolution\n" +
             "• End-to-end local robocopy file copy\n\n" +
             "Proceed with the test suite?",
@@ -157,15 +157,30 @@ public partial class MainForm
         using var dlg = new BackupTriggerForm(computerName);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
-        var cts = new CancellationTokenSource();
-        Log("INFO", computerName, $"Initializing {dlg.SelectedBackupType} backup session...");
-        UpdateComputerStatus(computerName, "In Progress");
+        using var cts = new CancellationTokenSource();
+        await ExecuteBackupAsync(computerName, dlg.SelectedBackupType, dlg.VeraCryptPassword, cts.Token);
+    }
 
+    private async Task ExecuteBackupAsync(string computerName, string backupType, string veraCryptPassword, CancellationToken ct)
+    {
+        if (!_activeBackupJobs.TryAdd(computerName, true))
+        {
+            Log("WARN", computerName, "Backup skipped: a backup session is already active for this host.");
+            return;
+        }
+
+        bool semaphoreAcquired = false;
         try
         {
+            await _backupSemaphore.WaitAsync(ct);
+            semaphoreAcquired = true;
+
+            Log("INFO", computerName, $"Initializing {backupType} backup session...");
+            UpdateComputerStatus(computerName, "In Progress");
+
             var progress = new Progress<string>(msg => Log(msg, computer: computerName));
             var orch = new BackupOrchestrator(_settings);
-            await orch.RunAsync(computerName, dlg.SelectedBackupType, dlg.VeraCryptPassword, progress, cts.Token);
+            await orch.RunAsync(computerName, backupType, veraCryptPassword, progress, ct);
             UpdateComputerStatus(computerName, "Success");
         }
         catch (OperationCanceledException)
@@ -180,7 +195,11 @@ public partial class MainForm
         }
         finally
         {
-            RefreshGrids(); UpdateKpis();
+            if (semaphoreAcquired)
+                _backupSemaphore.Release();
+            _activeBackupJobs.TryRemove(computerName, out _);
+            RefreshGrids();
+            UpdateKpis();
         }
     }
 
@@ -210,10 +229,42 @@ public partial class MainForm
 
     private void OnScheduledBackup(string backupType)
     {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => OnScheduledBackup(backupType));
+            return;
+        }
+        _ = RunScheduledBackupAsync(backupType);
+    }
+
+    private async Task RunScheduledBackupAsync(string backupType)
+    {
+        string veraCryptPassword;
+        if (VeraCryptManager.IsMounted(_settings.MountLetter))
+        {
+            veraCryptPassword = string.Empty;
+        }
+        else if (_settings.AllowUnattendedVaultMount)
+        {
+            var stored = VaultSecretStore.LoadPassphrase();
+            if (string.IsNullOrEmpty(stored))
+            {
+                Log("ERROR", "SCHEDULER", "Scheduled backup skipped: VeraCrypt vault is locked and unattended mount is not configured.");
+                return;
+            }
+            veraCryptPassword = stored;
+        }
+        else
+        {
+            Log("ERROR", "SCHEDULER", "Scheduled backup skipped: VeraCrypt vault is locked and unattended mount is not configured.");
+            return;
+        }
+
         var online = _computers.Where(c => c.IsOnline).ToList();
         Log("INFO", "SCHEDULER", $"Scheduled {backupType} triggered. Targets: {online.Count} online machines.");
-        foreach (var c in online)
-            _ = TriggerBackup(c.ComputerName); // fire-and-forget; orchestrator is sequential per machine
+
+        var jobs = online.Select(c => ExecuteBackupAsync(c.ComputerName, backupType, veraCryptPassword, CancellationToken.None));
+        await Task.WhenAll(jobs);
     }
 
     // ── Create VeraCrypt Volume ────────────────────────────────────────────────
@@ -327,11 +378,39 @@ public partial class MainForm
         }
     }
 
+    private void SaveVaultPassphrase(object? sender, EventArgs e)
+    {
+        var pass = _tbVaultPass.Text;
+        if (string.IsNullOrEmpty(pass))
+        {
+            MessageBox.Show("Enter a passphrase before saving.", "Missing Passphrase", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        VaultSecretStore.SavePassphrase(pass);
+        _tbVaultPass.Text = string.Empty;
+        _lblVaultPassStatus.Text = "Status: DPAPI passphrase stored.";
+        _lblVaultPassStatus.ForeColor = Theme.Success;
+        Log("INFO", "SYSTEM", "Unattended VeraCrypt vault passphrase encrypted and saved via DPAPI.");
+        MessageBox.Show("Unattended vault passphrase saved securely.", "Passphrase Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void ClearVaultPassphrase(object? sender, EventArgs e)
+    {
+        VaultSecretStore.ClearPassphrase();
+        _tbVaultPass.Text = string.Empty;
+        _lblVaultPassStatus.Text = "Status: No unattended passphrase stored.";
+        _lblVaultPassStatus.ForeColor = Theme.TextSecondary;
+        Log("INFO", "SYSTEM", "Unattended VeraCrypt vault passphrase cleared.");
+        MessageBox.Show("Unattended vault passphrase cleared.", "Passphrase Cleared", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
     private void SaveVeraCryptSettings(object? sender, EventArgs e)
     {
-        _settings.VeraCryptExePath   = _tbVcExe.Text.Trim();
-        _settings.VeraCryptContainer = _tbVcCon.Text.Trim();
-        _settings.MountLetter        = _tbMount.Text.Trim().ToUpper();
+        _settings.VeraCryptExePath          = _tbVcExe.Text.Trim();
+        _settings.VeraCryptContainer        = _tbVcCon.Text.Trim();
+        _settings.MountLetter               = _tbMount.Text.Trim().ToUpper();
+        _settings.AllowUnattendedVaultMount = _chkUnattendedMount.Checked;
         AppConfig.SaveSettings(_settings);
         UpdateKpis();
         MessageBox.Show("VeraCrypt settings saved.", "Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -354,12 +433,25 @@ public partial class MainForm
 
     private void SaveAdSettings(object? sender, EventArgs e)
     {
-        _settings.SearchOU      = _tbOU.Text.Trim();
-        _settings.AdGroup       = _tbGroup.Text.Trim();
-        _settings.ScheduleActive = _chkSched.Checked;
-        _settings.NightlyCron   = _tbNightly.Text.Trim();
-        _settings.WeeklyCron    = _tbWeekly.Text.Trim();
+        if (!int.TryParse(_tbMaxConcurrent.Text.Trim(), out int maxConc) || maxConc < 1)
+        {
+            MessageBox.Show("Max concurrent backups must be an integer of at least 1.", "Invalid Value", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _settings.SearchOU             = _tbOU.Text.Trim();
+        _settings.AdGroup              = _tbGroup.Text.Trim();
+        _settings.ScheduleActive       = _chkSched.Checked;
+        _settings.NightlyCron          = _tbNightly.Text.Trim();
+        _settings.WeeklyCron           = _tbWeekly.Text.Trim();
+        _settings.MaxConcurrentBackups = maxConc;
         AppConfig.SaveSettings(_settings);
+
+        if (_activeBackupJobs.IsEmpty)
+        {
+            _backupSemaphore.Dispose();
+            _backupSemaphore = new SemaphoreSlim(maxConc, maxConc);
+        }
 
         _scheduler.Stop();
         _scheduler = new SchedulerService(_settings);

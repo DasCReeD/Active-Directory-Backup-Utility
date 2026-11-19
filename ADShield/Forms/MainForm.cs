@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ADShield.Core;
 using ADShield.Models;
 
@@ -8,6 +9,8 @@ public partial class MainForm : Form
     private AppSettings         _settings;
     private List<ComputerEntry> _computers;
     private SchedulerService    _scheduler;
+    private SemaphoreSlim       _backupSemaphore;
+    private readonly ConcurrentDictionary<string, bool> _activeBackupJobs = new(StringComparer.OrdinalIgnoreCase);
 
     private Panel _pnlContent = null!;
     private Label _lblPageTitle = null!, _lblBreadcrumb = null!;
@@ -25,18 +28,23 @@ public partial class MainForm : Form
     private readonly List<(string ts, string level, string comp, string msg)> _logRows = [];
 
     private TextBox  _tbVcExe = null!, _tbVcCon = null!, _tbMount = null!;
+    private CheckBox _chkUnattendedMount = null!;
+    private TextBox  _tbVaultPass = null!;
+    private Label    _lblVaultPassStatus = null!;
     private TextBox  _tbBackupRoot = null!, _tbVhdxSize = null!;
     private TextBox  _tbOU = null!, _tbGroup = null!;
     private CheckBox _chkSched = null!;
-    private TextBox  _tbNightly = null!, _tbWeekly = null!;
+    private TextBox  _tbNightly = null!, _tbWeekly = null!, _tbMaxConcurrent = null!;
 
     private Button? _activeNav;
 
     public MainForm()
     {
-        _settings  = AppConfig.ReadSettings();
-        _computers = AppConfig.ReadHistory();
-        _scheduler = new SchedulerService(_settings);
+        _settings        = AppConfig.ReadSettings();
+        _computers       = AppConfig.ReadHistory();
+        int maxConc      = Math.Max(1, _settings.MaxConcurrentBackups);
+        _backupSemaphore = new SemaphoreSlim(maxConc, maxConc);
+        _scheduler       = new SchedulerService(_settings);
         _scheduler.BackupTriggered += OnScheduledBackup;
 
         SuspendLayout();
@@ -314,6 +322,42 @@ public partial class MainForm : Form
 
         _tbMount = AddField(fVc, "Mount Drive Letter (single char A–Z)", _settings.MountLetter, "e.g. V");
         _tbMount.MaxLength = 1;
+
+        fVc.Controls.Add(new Panel { Height = 1, Width = 460, BackColor = Theme.Border, Margin = new Padding(0, 10, 0, 6) });
+
+        _chkUnattendedMount = new CheckBox
+        {
+            Text = "Allow Unattended Vault Mount (Scheduled Backups)",
+            ForeColor = Theme.TextPrimary, Font = Theme.FontBase,
+            AutoSize = true, Checked = _settings.AllowUnattendedVaultMount,
+            Margin = new Padding(0, 4, 0, 4),
+        };
+        fVc.Controls.Add(_chkUnattendedMount);
+
+        _tbVaultPass = AddField(fVc, "Unattended Vault Passphrase (DPAPI Encrypted)", "", "Enter passphrase to store securely");
+        _tbVaultPass.UseSystemPasswordChar = true;
+
+        _lblVaultPassStatus = new Label
+        {
+            Text = VaultSecretStore.HasPassphrase()
+                ? "Status: DPAPI passphrase stored."
+                : "Status: No unattended passphrase stored.",
+            ForeColor = VaultSecretStore.HasPassphrase() ? Theme.Success : Theme.TextSecondary,
+            Font = Theme.FontSmall, AutoSize = false, Width = 460, Height = 18,
+            Margin = new Padding(0, 4, 0, 2),
+        };
+        fVc.Controls.Add(_lblVaultPassStatus);
+
+        var passBtnRow = new Panel { Width = 460, Height = 36, Margin = new Padding(0, 4, 0, 2), BackColor = Theme.Surface };
+        var btnSavePass = Theme.MakeButton("Save Passphrase");
+        btnSavePass.Width = 224; btnSavePass.Height = 32; btnSavePass.Location = new Point(0, 0);
+        btnSavePass.Click += SaveVaultPassphrase;
+        var btnClearPass = Theme.MakeButton("Clear Passphrase");
+        btnClearPass.Width = 224; btnClearPass.Height = 32; btnClearPass.Location = new Point(236, 0);
+        btnClearPass.Click += ClearVaultPassphrase;
+        passBtnRow.Controls.AddRange([btnSavePass, btnClearPass]);
+        fVc.Controls.Add(passBtnRow);
+
         var bVc = Theme.MakeButton("Save Vault Config", primary: true);
         bVc.Width = 460; bVc.Margin = new Padding(0, 10, 0, 0);
         bVc.Click += SaveVeraCryptSettings;
@@ -349,6 +393,7 @@ public partial class MainForm : Form
         fAd.Controls.Add(_chkSched);
         _tbNightly = AddField(fAd, "Nightly Incremental — Cron", _settings.NightlyCron, "e.g. 0 1 * * *");
         _tbWeekly  = AddField(fAd, "Weekly Full — Cron", _settings.WeeklyCron, "e.g. 0 0 * * 0");
+        _tbMaxConcurrent = AddField(fAd, "Max Concurrent Scheduled Backups (min 1)", Math.Max(1, _settings.MaxConcurrentBackups).ToString(), "e.g. 1");
         var bAd = Theme.MakeButton("Save AD Settings", primary: true);
         bAd.Width = 460; bAd.Margin = new Padding(0, 10, 0, 0);
         bAd.Click += SaveAdSettings;

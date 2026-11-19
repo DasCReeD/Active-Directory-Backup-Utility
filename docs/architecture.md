@@ -2,9 +2,9 @@
 
 ## Overview
 
-ADShield is an **agentless, encrypted network backup orchestrator** for Windows Active Directory environments. It runs as a native Windows Forms application (.NET 8) on a Domain Controller or backup server, and coordinates full system-image and incremental VSS backups across all domain computers — without installing any software on target machines.
+ADShield is a **100% agentless, encrypted network backup orchestrator** for Windows Active Directory environments. It compiles to a single .NET 8 executable (`ADShield.exe`) that runs exclusively on the backup server as a Windows Forms GUI or CLI automation tool, coordinating VSS shadow copy creation via WMI and server-pull `robocopy.exe` transfers over SMB admin shares (`C$`) into per-machine VHDX disks inside an AES-256 VeraCrypt vault.
 
-The backup engine uses a **server-pull architecture**: robocopy runs locally on the backup server and reads from each client's admin share (`\\CLIENT\C$`) through a VSS symlink. This eliminates the Kerberos double-hop authentication problem entirely.
+> **AD & GPO Operational Guide:** See **[AGENTLESS_ROADMAP.md](AGENTLESS_ROADMAP.md)** for the Group Policy (GPO) firewall rules, R2L symlink evaluation policy, and least-privilege AD service account / gMSA setup.
 
 ---
 
@@ -15,101 +15,94 @@ The backup engine uses a **server-pull architecture**: robocopy runs locally on 
 ```mermaid
 graph TB
     subgraph "Backup Server / Domain Controller"
-        UI["🖥️ ADShield WinForms UI\n(MainForm.cs)"]
-        BO["⚙️ BackupOrchestrator\n(Core — Server-Pull)"]
-        AD["🔍 AdDiscovery\n(LDAP)"]
-        VC["🔐 VeraCryptManager\n(Encrypted Vault)"]
-        VSS["📸 VssManager\n(WMI Shadow Copy)"]
-        VHDX["💾 VhdxManager\n(VirtDisk API)"]
-        SCHED["⏰ SchedulerService\n(System.Threading.Timer)"]
-        CFG["🗂️ AppConfig\n(JSON persistence)"]
-        VAULT["🔒 VeraCrypt Vault\n(.hc container)"]
-        VHDX_FILE["📦 disk.vhdx\n(per-machine virtual disk)"]
-        ROBO["📋 robocopy.exe\n(runs LOCALLY on server)"]
+        PRG["Program.cs\n(GUI / CLI)"]
+        UI["ADShield WinForms UI\n(MainForm.cs + MainForm.Events.cs)"]
+        BO["BackupOrchestrator\n(Agentless Server-Pull)"]
+        AD["AdDiscovery\n(LDAP + Ping)"]
+        VC["VeraCryptManager\n(Encrypted Vault)"]
+        VSS_STORE["VaultSecretStore\n(DPAPI crypt32.dll)"]
+        VHDX["VhdxManager + diskpart\n(VirtDisk API, Dynamic Z..M)"]
+        VSS["VssManager\n(WMI Win32_ShadowCopy)"]
+        PR["ProcessRunner\n(Async Process Tree)"]
+        SCHED["SchedulerService\n(Re-entrancy Guarded)"]
+        CFG["AppConfig\n(JSON persistence)"]
+        VAULT["VeraCrypt Vault\n(.hc container)"]
+        VHDX_FILE["disk.vhdx\n(per-machine virtual disk)"]
+        ROBO["robocopy.exe\n(runs LOCALLY on server)"]
     end
 
     subgraph "Active Directory"
         LDAP["LDAP Directory"]
     end
 
-    subgraph "Target Client Workstation"
-        CLIENT["💻 Domain Computer\n(WMI endpoint)"]
+    subgraph "Target Client Workstation (Zero Agent)"
+        CLIENT["Domain Computer\n(WMI / DCOM)"]
         VSS_CLIENT["VSS Shadow Copy\n(on C:\\)"]
-        SYMLINK["Symlink\n(C:\\adshield_vss_link)"]
+        SYMLINK["Temp Symlink\n(C:\\_adshield_vss_<id>)"]
         ADMIN_SHARE["Admin Share\n(C$)"]
     end
 
-    UI -->|triggers| BO
+    PRG --> UI
+    PRG --> BO
+    UI -->|SemaphoreSlim + triggers| BO
     UI -->|triggers| AD
     UI -->|reads/writes| CFG
+    UI -->|unattended passphrase| VSS_STORE
     AD -->|LDAP query| LDAP
     BO -->|mount/dismount| VC
-    BO -->|create/attach| VHDX
-    BO -->|trigger| VSS
+    BO -->|create/attach/detach| VHDX
+    BO -->|WMI probe, disk space, VSS| VSS
     VC --> VAULT
     VHDX --> VHDX_FILE
     VAULT -.->|contains| VHDX_FILE
-    SCHED -->|fires event| BO
-    BO -->|WMI: VSS + symlink| CLIENT
+    SCHED -->|fires event| UI
+    BO -->|WMI Win32_Process: mklink/rmdir| CLIENT
+    VSS -->|WMI: Win32_ShadowCopy| CLIENT
     CLIENT --> VSS_CLIENT
-    VSS_CLIENT -->|device path| SYMLINK
+    VSS_CLIENT -->|DeviceObject| SYMLINK
     SYMLINK -->|exposed via| ADMIN_SHARE
     ROBO -->|reads from| ADMIN_SHARE
     ROBO -->|writes to| VHDX_FILE
+    BO -->|runs via ProcessRunner| ROBO
 ```
 
 ---
 
-### Backup Sequence Flow (Server-Pull)
+### Backup Sequence Flow (100% Agentless Server-Pull)
 
 ```mermaid
 sequenceDiagram
-    participant UI as ADShield UI
-    participant BO as BackupOrchestrator
-    participant VC as VeraCryptManager
-    participant VX as VhdxManager
-    participant VSS as VssManager
-    participant CLI as Target Client (WMI)
-    participant ROBO as robocopy (LOCAL)
+    autonumber
+    participant Caller as MainForm / CLI
+    participant BO as BackupOrchestrator (Server)
+    participant VC as VeraCryptManager (V:\)
+    participant VX as VhdxManager + diskpart (Z..M)
+    participant VSS as VssManager (WMI)
+    participant CLI as Target Client (WMI + C$)
+    participant ROBO as robocopy.exe (Local Server)
 
-    UI->>BO: RunAsync(computerName, backupType, password)
+    Caller->>BO: RunAsync(computerName, backupType, password, progress, ct)
+    BO->>VC: IsMounted(V:) / MountAsync()
+    BO->>CLI: Ping.SendPingAsync (1500ms)
+    BO->>VSS: TestWmiConnectivity(computerName, out error)
 
-    BO->>VC: IsMounted(mountLetter)?
-    alt Not Mounted
-        BO->>VC: Mount(settings, password)
-    end
+    Note over BO,VX: Hardened ACLs (Administrators + SYSTEM) & Dynamic Sizing (UsedGb * 1.2)
+    BO->>VSS: QueryRemoteDiskSpace(computerName, "C:")
+    BO->>VX: CreateVhdx(V:\backups\{computer}\disk.vhdx) [if new]
+    BO->>VX: Allocate free drive letter (Z..M) + AttachVhdx + diskpart init/assign
+    BO->>VX: Self-heal write probe (clean + GPT + quick NTFS if RAW/unwritable)
 
-    BO->>CLI: Ping (ICMP check)
-    BO->>VSS: TestWmiConnectivity(computerName)
+    BO->>VSS: CreateRemoteShadowCopy(computerName, "C:\\")
+    BO->>VSS: GetShadowCopyDeviceObject(computerName, shadowId)
+    BO->>CLI: WMI Win32_Process.Create (cmd.exe /c mklink /d C:\_adshield_vss_{id} DeviceObject)
 
-    BO->>VX: VhdxExists(vhdxPath)?
-    alt New VHDX
-        BO->>CLI: GetRemoteDiskUsage() via WMI
-        BO->>VX: CreateVhdx(path, sizeBytes)
-    end
-
-    BO->>BO: RunLocalDiskpart(attach vdisk)
-    BO->>BO: RunLocalDiskpart(init partition + format NTFS)
-
-    Note over BO: Self-heal check: verify B:\ is writable
-    alt Drive not writable
-        BO->>BO: RunLocalDiskpart(clean + reformat NTFS)
-    end
-
-    BO->>CLI: EnableRemoteSymlinkEvaluation (WMI registry)
-    BO->>VSS: CreateRemoteShadowCopy(computerName, C:\)
-    BO->>BO: GetShadowDevicePath(computerName, shadowId)
-    BO->>CLI: CreateRemoteVssSymlink (WMI Win32_Process)
-
-    Note over ROBO: Server-pull: robocopy runs LOCALLY
-    ROBO->>CLI: Read from \\CLIENT\C$\adshield_vss_link
-    ROBO->>BO: Write to B:\ (local VHDX)
-
-    BO->>CLI: RemoveRemoteVssSymlink (WMI)
-    BO->>VSS: DeleteShadowCopy(shadowId)
-    BO->>BO: RunLocalDiskpart(detach vdisk)
+    BO->>ROBO: robocopy \\{computer}\C$\_adshield_vss_{id} -> {drive}:\{backupType}\
     BO->>BO: AppConfig.UpdateBackupResult(computerName, "Success")
-    BO-->>UI: Progress complete
+
+    Note over BO,CLI: finally block (always runs on success, failure, or cancellation)
+    BO->>CLI: WMI Win32_Process.Create (cmd.exe /c if exist ... rmdir ...)
+    BO->>VSS: DeleteRemoteShadowCopy(computerName, shadowId)
+    BO->>VX: DetachVhdx (with diskpart fallback)
 ```
 
 ---
@@ -118,7 +111,8 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph "Presentation Layer"
+    subgraph "Entry & Presentation"
+        PRG[Program.cs]
         MF[MainForm.cs]
         MFE[MainForm.Events.cs]
         BTF[BackupTriggerForm.cs]
@@ -131,10 +125,13 @@ graph LR
         VC[VeraCryptManager]
         VSS[VssManager]
         VX[VhdxManager]
+        SMB[SmbShareManager]
+        PR[ProcessRunner]
         SC[SchedulerService]
         CFG[AppConfig]
-        SHT[BackupSelfHealingTest]
-        SPT[BackupServerPullTest]
+        VST[VaultSecretStore]
+        VAL[BackupValidationSuite]
+        SHD[SelfHealingDiagnostics]
     end
 
     subgraph "Models"
@@ -143,57 +140,64 @@ graph LR
         SCI[ShadowCopyInfo]
     end
 
-    subgraph "External APIs"
-        WMI["WMI / Win32_*\nStdRegProv"]
+    subgraph "External APIs & Binaries"
+        WMI["WMI / Win32_ShadowCopy\nWin32_Process / Win32_LogicalDisk"]
         LDAP2[System.DirectoryServices]
         VD[VirtDisk.dll P/Invoke]
+        CR[crypt32.dll DPAPI]
         VCEXE[VeraCrypt.exe CLI]
         DP[diskpart.exe]
         RC[robocopy.exe]
     end
 
+    PRG --> MF
+    PRG --> BO
+    PRG --> VC
+    PRG --> AD
+    PRG --> VAL
+    PRG --> SHD
+
     MF --> MFE
     MF --> BTF
     MF --> TH
-    MF --> BO
-    MF --> AD
     MF --> SC
     MF --> CFG
+    MFE --> BO
+    MFE --> AD
+    MFE --> VC
+    MFE --> VST
+    MFE --> VAL
+    MFE --> SHD
 
     BO --> VC
     BO --> VX
     BO --> VSS
     BO --> CFG
-    BO --> RC
+    BO --> PR
 
-    SHT --> BO
-    SHT --> VX
+    PR --> VCEXE
+    PR --> DP
+    PR --> RC
 
-    SPT --> BO
-    SPT --> VSS
-    SPT --> VX
+    SHD --> BO
+    SHD --> VX
+    VAL --> PR
+    VST --> CR
+    VST --> CFG
 
     AD --> CFG
     AD --> CE
+    AD --> LDAP2
 
     SC --> AS
-
     CFG --> AS
     CFG --> CE
 
-    VC --> AS
-    VC --> VCEXE
     VC --> WMI
-
+    SMB --> WMI
     VSS --> WMI
     VSS --> SCI
-
     VX --> VD
-
-    AD --> LDAP2
-
-    BO --> WMI
-    BO --> DP
 ```
 
 ---
@@ -211,14 +215,13 @@ graph TD
         PC2VHDX["V:\\backups\\SERVER-02\\disk.vhdx"]
     end
 
-    subgraph "VHDX Virtual Disk (mounted locally as B:\\)"
+    subgraph "VHDX Virtual Disk (dynamically mounted Z..M)"
         VHDXPart["NTFS Partition (ADShield label)"]
-        BackupData["VSS Backup Data"]
-        IncrData["Incremental Versions"]
+        BackupData["Incremental / Full Backup Data"]
     end
 
     subgraph "Server-Pull Data Path"
-        AdminShare["\\\\CLIENT\\C$\\adshield_vss_link"]
+        AdminShare["\\\\CLIENT\\C$\\_adshield_vss_<id>"]
         LocalRobocopy["robocopy.exe (runs on server)"]
     end
 
@@ -230,43 +233,9 @@ graph TD
 
     PC1VHDX -->|attached locally| VHDXPart
     VHDXPart --> BackupData
-    VHDXPart --> IncrData
 
     AdminShare -->|reads from| LocalRobocopy
     LocalRobocopy -->|writes to| VHDXPart
-```
-
----
-
-## Network Authentication Model
-
-```mermaid
-graph LR
-    subgraph "Single-Hop Authentication"
-        SERVER["Backup Server\n(david.snyder)"]
-        CLIENT["Target Client\n(LOCALVM)"]
-
-        SERVER -->|"WMI (hop 1): VSS, symlink, registry"| CLIENT
-        SERVER -->|"robocopy /B (hop 1): \\CLIENT\\C$"| CLIENT
-    end
-
-    subgraph "Why This Works"
-        NOTE["✅ Single network hop\n✅ Domain admin credentials\n✅ No impersonation delegation\n✅ No double-hop"]
-    end
-```
-
-### Previous Architecture (Deprecated)
-
-The old client-push model ran robocopy ON the client, which required a second authentication hop back to the server's SMB share. This caused `ERROR 5 (Access Denied)` due to the Kerberos double-hop restriction:
-
-```
-Server → Client (hop 1) → Server SMB share (hop 2) ❌ BLOCKED
-```
-
-The server-pull model eliminates this:
-
-```
-Server → Client admin share (hop 1 only) ✅
 ```
 
 ---
@@ -276,53 +245,30 @@ Server → Client admin share (hop 1 only) ✅
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | **UI Framework** | Windows Forms (.NET 8) | Desktop GUI for backup management |
-| **Language** | C# 12 | Core application logic |
+| **Language** | C# 12 | Core application logic and CLI |
 | **AD Integration** | `System.DirectoryServices` | LDAP queries against Active Directory |
-| **Remote Management** | WMI (`System.Management`) | Agentless remote VSS, symlinks, registry |
+| **Remote Management** | WMI (`System.Management`) | Agentless `Win32_ShadowCopy`, `Win32_LogicalDisk`, `Win32_Process` |
 | **Virtual Disk** | `VirtDisk.dll` (P/Invoke) | Native VHDX creation, attach, detach |
-| **Disk Partitioning** | `diskpart.exe` (local shell) | NTFS format, partition assignment |
-| **Encryption** | `VeraCrypt.exe` (CLI) | AES-256 container mount/dismount |
+| **Disk Partitioning** | `diskpart.exe` (via `ProcessRunner`) | NTFS format, dynamic drive letter assignment (`Z`–`M`) |
+| **Encryption** | `VeraCrypt.exe` (via `ProcessRunner`) | AES-256 container mount/dismount/create |
+| **Secret Store** | `crypt32.dll` DPAPI (`VaultSecretStore`) | Optional encrypted unattended passphrase (`vault.dat`) |
 | **File Copy** | `robocopy.exe` (local, `/B` mode) | Server-pull data transfer with backup privilege |
 | **Persistence** | `Newtonsoft.Json` | Config and history serialization |
-| **Scheduling** | `System.Threading.Timer` | Cron-style nightly/weekly triggers |
+| **Scheduling** | `System.Threading.Timer` | Re-entrancy-guarded nightly/weekly triggers |
 
 ---
 
 ## Security Architecture
 
-```mermaid
-graph TB
-    subgraph "Encryption Boundary"
-        VC_Container["VeraCrypt .hc Container\n(AES-256 / SHA-512)"]
-        VHDX_Inside["disk.vhdx files\n(inside encrypted vault)"]
-    end
-
-    subgraph "Network Access"
-        AdminShare["Admin Share (C$)\n(built-in, pre-existing)"]
-        R2L["R2L Symlink Evaluation\n(enabled per-client via WMI)"]
-    end
-
-    subgraph "Credential Management"
-        PassMem["VeraCrypt passphrase\n(in-memory only, never stored)"]
-        DomainAuth["Domain Admin credentials\n(single-hop WMI + admin share)"]
-    end
-
-    VC_Container -->|decrypted on mount| VHDX_Inside
-    DomainAuth -->|authenticates| AdminShare
-    R2L -->|allows traversal of| AdminShare
-    PassMem -->|used once| VC_Container
-```
-
-**Security Principles:**
-- The VeraCrypt passphrase is **never persisted** to disk; it is entered at runtime per-backup session
-- No dynamic SMB shares are created — the server reads from the **pre-existing admin share** (`C$`)
-- R2L symlink evaluation is enabled via **WMI registry write** (`StdRegProv`), not manual configuration
-- All backup data at rest is inside an **AES-256 encrypted** VeraCrypt volume
-- Robocopy runs with `/B` (backup mode) using `SeBackupPrivilege` for ACL bypass on source files
+- **Zero client attack surface:** No agent, service, or HTTP listener runs on target machines.
+- **Least-privilege GPO model:** Target OUs are governed by GPO firewall rules (scoped to the backup server IP), R2L symlink evaluation policy, and a dedicated AD backup service account / gMSA.
+- **Hardened VHDX folder ACLs:** Per-machine backup folders grant `FullControl` only to `BUILTIN\Administrators` (`*S-1-5-32-544`) and `NT AUTHORITY\SYSTEM` (`*S-1-5-18`) — never `Everyone`, `Authenticated Users`, or `Domain Computers`.
+- **VeraCrypt passphrase protection:** Held in memory only for interactive runs, or optionally stored via Windows DPAPI (`CryptProtectData`) in `%AppData%\ADShield\vault.dat` when `AllowUnattendedVaultMount` is explicitly enabled.
+- **All backup data at rest** resides inside an **AES-256 encrypted** VeraCrypt container.
 
 ---
 
-## Scheduler Architecture
+## Scheduler & Concurrency Architecture
 
 ```mermaid
 stateDiagram-v2
@@ -330,31 +276,28 @@ stateDiagram-v2
     Stopped --> Active: ScheduleActive = true\nStart() called
     Active --> NightlyFired: Cron time reached\n(default: 01:00 daily)
     Active --> WeeklyFired: Cron time reached\n(default: Sunday 00:00)
-    NightlyFired --> Active: Reschedule next day\nFire "Incremental"
-    WeeklyFired --> Active: Reschedule next week\nFire "Full"
+    NightlyFired --> Active: Interlocked guard prevents overlap\nFire "Incremental"
+    WeeklyFired --> Active: Interlocked guard prevents overlap\nFire "Full"
     Active --> Stopped: Stop() / Dispose()
 ```
 
+In `MainForm.Events.cs`, scheduled and manual backups share `ExecuteBackupAsync`, gated by a `SemaphoreSlim` (`MaxConcurrentBackups`, minimum `1`) and a `ConcurrentDictionary<string, bool>` active-job tracker to prevent duplicate concurrent backups for the same host.
+
 ---
 
-## Test Suites
+## Test & Diagnostic Suites
 
-### BackupSelfHealingTest
+### `ADShield.Tests` (xUnit)
 
-Tests the VHDX lifecycle and self-healing format recovery:
+| Test Class | File | What It Validates |
+|------------|------|-------------------|
+| `UnitTests` | `ADShield.Tests/UnitTests.cs` | `AppSettings` defaults & JSON round-trip, `SchedulerService` inactive start & idempotent `Dispose`, `ParseCronHM`, `RunLocalDiskpart` non-zero exit code exception (admin-gated), `ProcessRunner` streams/cancellation/timeout |
+| `LogicTests` | `ADShield.Tests/LogicTests.cs` | `TestVhdxCreateAndFormat` (admin), `TestVhdxExistingMount` (admin), `TestRobocopyArgumentQuoting`, `TestVeraCryptMountDetection`, `TestUncPathResolutionEdgeCases`, `TestRobocopyLocalCopy` |
+| `SelfHealingTests` | `ADShield.Tests/SelfHealingTests.cs` | `TestSelfHealingDiagnostics` — admin-gated wrapper around `SelfHealingDiagnostics.RunDiagnosticsAsync` |
 
-| Test | What It Validates |
-|------|-------------------|
-| `TestVhdxCreateAndFormat` | VHDX creation via VirtDisk API + diskpart NTFS format |
-| `TestSelfHealDetection` | Detects unwritable/RAW partitions and triggers reformat |
-| `TestQuickFormatRecovery` | Full clean → GPT → NTFS recovery pipeline |
+### Built-in Runtime Diagnostics (`ADShield/Core/`)
 
-### BackupServerPullTest
-
-Tests the server-pull backup architecture end-to-end:
-
-| Test | What It Validates |
-|------|-------------------|
-| `TestR2LSymlinkEvaluation` | WMI registry write to enable R2L on remote client |
-| `TestVssSymlinkAccess` | VSS shadow + symlink creation → server `Directory.GetDirectories()` via admin share |
-| `TestEndToEndServerPull` | Full pipeline: VHDX → VSS → symlink → robocopy pull → verify copied data |
+| Class | Trigger | What It Validates |
+|-------|---------|-------------------|
+| `BackupValidationSuite` | UI (`Run Tests` → Validation) or `--test` | Temp directory R/W, `diskpart.exe /s`, and `robocopy.exe /?` |
+| `SelfHealingDiagnostics` | UI (`Run Tests` → Diagnostics) or `--diagnostics` | Creates a 10 MB RAW VHDX in `AppConfig.ReadSettings().BackupRootPath`, allocates a free drive letter (`Z`..`M`), verifies raw write fails, runs GPT/NTFS recovery, and verifies write succeeds |
